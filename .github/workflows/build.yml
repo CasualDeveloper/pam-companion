@@ -9,7 +9,7 @@ on:
     - cron: '0 0 1 */2 *'
 
 env:
-  outPath: "/usr/local/lib/pam/pam_watchid.so"
+  outPath: "/usr/local/lib/pam/pam_companion.so"
 
 jobs:
   build:
@@ -48,7 +48,7 @@ jobs:
       uses: actions/upload-artifact@v4
       if: ${{ matrix.xcode-select == 'xcode' && matrix.version == 15 }}
       with:
-        name: pam-watchid.so.${{ steps.getVersion.outputs.version }}
+        name: pam-companion.so.${{ steps.getVersion.outputs.version }}
         path: ${{ env.outPath }}.${{ steps.getVersion.outputs.version }}
         if-no-files-found: error
         retention-days: ${{ github.event_name == 'pull_request' && 7 || 90 }}

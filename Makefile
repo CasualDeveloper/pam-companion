@@ -1,6 +1,6 @@
 VERSION = $(shell cat VERSION)
 LIBRARY_DIR = /usr/local/lib/pam
-LIBRARY_PREFIX = pam_watchid
+LIBRARY_PREFIX = pam_companion
 LIBRARY_NAME = $(LIBRARY_PREFIX).so
 LIBRARY_PATH = $(LIBRARY_DIR)/$(LIBRARY_NAME)
 TARGET = apple-macosx10.15
@@ -13,13 +13,13 @@ ifeq ($(shell [[ '$(shell xcode-select -p)' == '/Library/Developer/CommandLineTo
 # Legacy build
 # For CLT due to poor support for building swift packages.
 # Swift packages do work in macOS Sonoma and later with the CLT, but are an order of magnitude slower than Xcode. 
-	swiftc Sources/pam-watchid/pam_watchid.swift -o $(LIBRARY_PREFIX)_x86_64.so -target x86_64-$(TARGET) -emit-library
-	swiftc Sources/pam-watchid/pam_watchid.swift -o $(LIBRARY_PREFIX)_arm64.so -target arm64-$(TARGET) -emit-library
+	swiftc Sources/pam-companion/pam_companion.swift -o $(LIBRARY_PREFIX)_x86_64.so -target x86_64-$(TARGET) -emit-library
+	swiftc Sources/pam-companion/pam_companion.swift -o $(LIBRARY_PREFIX)_arm64.so -target arm64-$(TARGET) -emit-library
 	lipo -create $(LIBRARY_PREFIX)_arm64.so $(LIBRARY_PREFIX)_x86_64.so -output $(LIBRARY_NAME)
 else
 # Swift Package Manager build
 	swift build -c release --arch x86_64 --arch arm64
-	mv .build/apple/Products/Release/libpam-watchid.dylib $(LIBRARY_NAME)
+	mv .build/apple/Products/Release/libpam-companion.dylib $(LIBRARY_NAME)
 endif
 
 install: all
@@ -38,7 +38,7 @@ else
 # Modify sudo_local if the library isn't already present in the file
 # Uncomment pam_tid.so
 	grep $(LIBRARY_NAME) $(PAM_FILE) > /dev/null || sudo sed -i ".old" -e '/$(PAM_TID_TEXT)/s/^# \{0,1\}//g' $(PAM_FILE)
-# Insert $(PAM_TEXT) after the pam_tid.so line. This allows pam_tid.so to be used by default (which unexpectedly allows watch authentication as well) with pam_watchid.so as a fallback in cases where pam_tid.so falls through due to TouchID being deemed unavailable by macOS.
+# Insert $(PAM_TEXT) after the pam_tid.so line. This allows pam_tid.so to be used by default (which unexpectedly allows watch authentication as well) with pam_companion.so as a fallback in cases where pam_tid.so falls through due to TouchID being deemed unavailable by macOS.
 	grep $(LIBRARY_NAME) $(PAM_FILE) > /dev/null || sudo sed -i "" -e '/$(PAM_TID_TEXT)/s/$$/\n$(PAM_TEXT)/g' $(PAM_FILE)
 endif
 
