@@ -84,7 +84,7 @@ struct PAMLifecycleFileSystem {
   }
 
   func readSourceModule(_ url: URL) throws -> Data {
-    try validateAncestors(of: url)
+    try validateAncestors(of: url, requiresPrivilegedOwnership: false)
     let descriptor = open(url.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
     guard descriptor >= 0 else { throw fileSystemError(url.path) }
     defer { close(descriptor) }
@@ -177,24 +177,52 @@ struct PAMLifecycleFileSystem {
     try validateStateDirectory(url)
   }
 
-  func snapshot(_ target: URL, backupName: String, stateDirectory: URL) throws
-    -> PAMLifecycleSnapshot
-  {
-    let descriptor = PAMLifecycleSnapshot(
+  func snapshot(_ target: URL, backupName: String) throws -> PAMLifecycleSnapshot {
+    guard exists(target) else {
+      return PAMLifecycleSnapshot(
+        path: target.path,
+        backupName: backupName,
+        existed: false,
+        originalSHA256: nil,
+        metadata: nil
+      )
+    }
+    try validateRegularRootTarget(target)
+    return PAMLifecycleSnapshot(
       path: target.path,
       backupName: backupName,
-      existed: exists(target)
+      existed: true,
+      originalSHA256: try sha256(target),
+      metadata: try metadata(target)
     )
-    guard descriptor.existed else { return descriptor }
-    try validateRegularRootTarget(target)
-    let backup = stateDirectory.appendingPathComponent(backupName)
-    try copy(target, to: backup)
-    try syncFile(backup)
-    try validateRegularRootTarget(backup)
-    return descriptor
+  }
+
+  func moveOriginalToBackup(_ snapshot: PAMLifecycleSnapshot, in stateDirectory: URL) throws {
+    let target = URL(fileURLWithPath: snapshot.path)
+    let backup = stateDirectory.appendingPathComponent(snapshot.backupName)
+    try validateStateDirectory(stateDirectory)
+    try validateAncestors(of: target)
+    if !snapshot.existed {
+      guard !exists(backup) else {
+        throw PAMLifecycleError.invalidState("unexpected backup: \(snapshot.backupName)")
+      }
+      guard !exists(target) else { throw PAMLifecycleError.managedStateDrift(snapshot.path) }
+      return
+    }
+    if exists(backup) {
+      try validateOriginal(snapshot, at: backup)
+      return
+    }
+    try validateOriginal(snapshot, at: target)
+    guard rename(target.path, backup.path) == 0 else { throw fileSystemError(target.path) }
+    try syncDirectory(target.deletingLastPathComponent())
+    try syncDirectory(stateDirectory)
+    try validateOriginal(snapshot, at: backup)
   }
 
   func installModule(_ data: Data, to target: URL) throws {
+    try validateAncestors(of: target)
+    guard !exists(target) else { throw PAMLifecycleError.managedStateDrift(target.path) }
     let temporary = temporarySibling(of: target)
     do {
       try data.write(to: temporary, options: [.withoutOverwriting])
@@ -211,21 +239,54 @@ struct PAMLifecycleFileSystem {
     }
   }
 
-  func replacePolicy(_ target: URL, with data: Data) throws {
-    try validateRegularRootTarget(target)
+  func moveStagedFile(
+    _ staged: URL,
+    to target: URL,
+    sha256 expectedSHA256: String,
+    metadata expectedMetadata: PAMFileMetadata
+  ) throws {
+    try validateAncestors(of: target)
+    guard !exists(target) else { throw PAMLifecycleError.managedStateDrift(target.path) }
+    guard
+      try managedFileMatches(
+        at: staged,
+        sha256: expectedSHA256,
+        metadata: expectedMetadata
+      )
+    else {
+      throw PAMLifecycleError.invalidState("staged file changed: \(staged.lastPathComponent)")
+    }
+    guard rename(staged.path, target.path) == 0 else { throw fileSystemError(target.path) }
+    try syncDirectory(staged.deletingLastPathComponent())
+    try syncDirectory(target.deletingLastPathComponent())
+    guard
+      try managedFileMatches(
+        at: target,
+        sha256: expectedSHA256,
+        metadata: expectedMetadata
+      )
+    else {
+      throw PAMLifecycleError.managedStateDrift(target.path)
+    }
+  }
+
+  func replacePolicy(_ target: URL, with data: Data, template: URL) throws {
+    try validateAncestors(of: target)
+    guard !exists(target) else { throw PAMLifecycleError.managedStateDrift(target.path) }
+    try validateRegularRootTarget(template)
     let temporary = temporarySibling(of: target)
     var info = stat()
-    guard lstat(target.path, &info) == 0 else { throw fileSystemError(target.path) }
+    guard lstat(template.path, &info) == 0 else { throw fileSystemError(template.path) }
     do {
-      try copy(target, to: temporary)
+      try copy(template, to: temporary)
       guard chmod(temporary.path, 0o600) == 0 else { throw fileSystemError(temporary.path) }
       do {
         try data.write(to: temporary, options: [])
       } catch {
         throw fileSystemError(temporary.path)
       }
-      guard chmod(temporary.path, info.st_mode & 0o7777) == 0,
-        chown(temporary.path, info.st_uid, info.st_gid) == 0
+      guard chown(temporary.path, info.st_uid, info.st_gid) == 0,
+        chmod(temporary.path, info.st_mode & 0o7777) == 0
       else {
         throw fileSystemError(temporary.path)
       }
@@ -239,35 +300,31 @@ struct PAMLifecycleFileSystem {
 
   func restore(_ snapshot: PAMLifecycleSnapshot, from stateDirectory: URL) throws {
     let target = URL(fileURLWithPath: snapshot.path)
+    let backup = stateDirectory.appendingPathComponent(snapshot.backupName)
+    try validateStateDirectory(stateDirectory)
+    try validateAncestors(of: target)
     if snapshot.existed {
-      let backup = stateDirectory.appendingPathComponent(snapshot.backupName)
-      let temporary = temporarySibling(of: target)
-      do {
-        try copy(backup, to: temporary)
-        try syncFile(temporary)
-        try replace(temporary, target: target)
-      } catch {
-        try? fileManager.removeItem(at: temporary)
-        throw error
+      if exists(backup) {
+        try validateOriginal(snapshot, at: backup)
+        guard rename(backup.path, target.path) == 0 else { throw fileSystemError(target.path) }
+        try syncDirectory(target.deletingLastPathComponent())
+        try syncDirectory(stateDirectory)
+        try validateOriginal(snapshot, at: target)
+      } else {
+        try validateOriginal(snapshot, at: target)
       }
-    } else if exists(target) {
+    } else {
+      guard !exists(backup) else {
+        throw PAMLifecycleError.invalidState("unexpected backup: \(snapshot.backupName)")
+      }
+      guard exists(target) else { return }
+      try validateRegularRootTarget(target)
       do {
         try fileManager.removeItem(at: target)
         try syncDirectory(target.deletingLastPathComponent())
       } catch {
         throw fileSystemError(target.path)
       }
-    }
-  }
-
-  func removeIfPresent(_ url: URL) throws {
-    guard exists(url) else { return }
-    try validateRegularRootTarget(url)
-    do {
-      try fileManager.removeItem(at: url)
-      try syncDirectory(url.deletingLastPathComponent())
-    } catch {
-      throw fileSystemError(url.path)
     }
   }
 
@@ -317,7 +374,7 @@ struct PAMLifecycleFileSystem {
     } catch {
       throw PAMLifecycleError.invalidState("record could not be decoded")
     }
-    guard record.schemaVersion == 1 else {
+    guard record.schemaVersion == 2 else {
       throw PAMLifecycleError.invalidState("unsupported schema version")
     }
     return record
@@ -328,6 +385,45 @@ struct PAMLifecycleFileSystem {
   }
 
   func sha256(_ url: URL) throws -> String { sha256(try read(url)) }
+
+  func metadata(_ url: URL) throws -> PAMFileMetadata {
+    var info = stat()
+    guard lstat(url.path, &info) == 0 else { throw fileSystemError(url.path) }
+    guard info.st_mode & S_IFMT == S_IFREG else {
+      throw PAMLifecycleError.unsafePath(url.path)
+    }
+    return PAMFileMetadata(
+      mode: UInt32(info.st_mode & 0o7777),
+      ownerUserID: UInt32(info.st_uid),
+      ownerGroupID: UInt32(info.st_gid),
+      flags: UInt32(info.st_flags),
+      extendedAttributes: try extendedAttributes(url)
+    )
+  }
+
+  func validateOriginal(_ snapshot: PAMLifecycleSnapshot, at url: URL) throws {
+    guard snapshot.existed,
+      let originalSHA256 = snapshot.originalSHA256,
+      let originalMetadata = snapshot.metadata
+    else {
+      throw PAMLifecycleError.invalidState("snapshot has no original: \(snapshot.path)")
+    }
+    try validateRegularRootTarget(url)
+    guard try sha256(url) == originalSHA256,
+      try metadata(url) == originalMetadata
+    else {
+      throw PAMLifecycleError.managedStateDrift(snapshot.path)
+    }
+  }
+
+  func managedFileMatches(
+    at url: URL,
+    sha256 expectedSHA256: String,
+    metadata expectedMetadata: PAMFileMetadata
+  ) throws -> Bool {
+    try validateRegularRootTarget(url)
+    return try sha256(url) == expectedSHA256 && metadata(url) == expectedMetadata
+  }
 
   func withLock<T>(_ url: URL, operation: () throws -> T) throws -> T {
     try validateDirectory(url.deletingLastPathComponent())
@@ -389,7 +485,10 @@ struct PAMLifecycleFileSystem {
     guard fsync(descriptor) == 0 else { throw fileSystemError(url.path) }
   }
 
-  private func validateAncestors(of url: URL) throws {
+  private func validateAncestors(
+    of url: URL,
+    requiresPrivilegedOwnership: Bool = true
+  ) throws {
     let parentPath = url.deletingLastPathComponent().path
     guard let resolved = realpath(parentPath, nil) else { throw fileSystemError(parentPath) }
     defer { free(resolved) }
@@ -399,19 +498,24 @@ struct PAMLifecycleFileSystem {
       relativeTo: nil
     )
     var current = URL(fileURLWithPath: "/", isDirectory: true)
-    try validateAncestor(current)
+    try validateAncestor(current, requiresPrivilegedOwnership: requiresPrivilegedOwnership)
     for component in parent.pathComponents.dropFirst() {
       current.appendPathComponent(component, isDirectory: true)
-      try validateAncestor(current)
+      try validateAncestor(current, requiresPrivilegedOwnership: requiresPrivilegedOwnership)
     }
   }
 
-  private func validateAncestor(_ url: URL) throws {
+  private func validateAncestor(_ url: URL, requiresPrivilegedOwnership: Bool) throws {
     var info = stat()
     guard lstat(url.path, &info) == 0 else { throw fileSystemError(url.path) }
+    let hasTrustedOwnership =
+      (info.st_uid == 0 && info.st_gid == 0)
+      || (info.st_uid == expectedOwnerUserID && info.st_gid == expectedOwnerGroupID)
     guard info.st_mode & S_IFMT == S_IFDIR,
       !hasUnsafeFlags(info),
-      try !hasExtendedACL(url.path)
+      try !hasExtendedACL(url.path),
+      !requiresPrivilegedOwnership
+        || (hasTrustedOwnership && info.st_mode & 0o022 == 0)
     else {
       throw PAMLifecycleError.unsafePath(url.path)
     }
@@ -441,6 +545,40 @@ struct PAMLifecycleFileSystem {
     }
     defer { acl_free(UnsafeMutableRawPointer(accessControlList)) }
     return try hasEntries(accessControlList, path: "file descriptor")
+  }
+
+  private func extendedAttributes(_ url: URL) throws -> [String: Data] {
+    let size = url.path.withCString { listxattr($0, nil, 0, XATTR_NOFOLLOW) }
+    guard size >= 0 else { throw fileSystemError(url.path) }
+    guard size > 0 else { return [:] }
+    var buffer = [CChar](repeating: 0, count: size)
+    let readCount = url.path.withCString { path in
+      listxattr(path, &buffer, buffer.count, XATTR_NOFOLLOW)
+    }
+    guard readCount == size else { throw fileSystemError(url.path) }
+    let names = Data(buffer.map { UInt8(bitPattern: $0) })
+      .split(separator: 0)
+      .map { String(decoding: $0, as: UTF8.self) }
+    var result: [String: Data] = [:]
+    for name in names {
+      let valueSize = url.path.withCString { path in
+        name.withCString { attribute in
+          getxattr(path, attribute, nil, 0, 0, XATTR_NOFOLLOW)
+        }
+      }
+      guard valueSize >= 0 else { throw fileSystemError(url.path) }
+      var value = Data(count: valueSize)
+      let valueRead = value.withUnsafeMutableBytes { bytes in
+        url.path.withCString { path in
+          name.withCString { attribute in
+            getxattr(path, attribute, bytes.baseAddress, bytes.count, 0, XATTR_NOFOLLOW)
+          }
+        }
+      }
+      guard valueRead == valueSize else { throw fileSystemError(url.path) }
+      result[name] = value
+    }
+    return result
   }
 
   private func hasEntries(_ accessControlList: acl_t, path: String) throws -> Bool {

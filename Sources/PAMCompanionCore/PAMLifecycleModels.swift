@@ -80,8 +80,12 @@ public protocol PAMLifecycleManaging: AnyObject {
 
 enum PAMLifecycleFailurePoint: String, CaseIterable, Codable, Sendable {
   case afterStatePrepared
+  case afterCanonicalBackedUp
   case afterModuleInstalled
+  case afterPolicyBackedUp
   case afterPolicyInstalled
+  case afterLegacyBackedUp
+  case afterVersionedLegacyBackedUp
   case afterLegacyRemoved
   case afterRestoreStarted
   case afterCanonicalRestored
@@ -92,8 +96,12 @@ enum PAMLifecycleFailurePoint: String, CaseIterable, Codable, Sendable {
 
   static let setupCases: [Self] = [
     .afterStatePrepared,
+    .afterCanonicalBackedUp,
     .afterModuleInstalled,
+    .afterPolicyBackedUp,
     .afterPolicyInstalled,
+    .afterLegacyBackedUp,
+    .afterVersionedLegacyBackedUp,
     .afterLegacyRemoved,
   ]
 
@@ -149,15 +157,26 @@ public enum PAMLifecycleError: Error, Equatable, CustomStringConvertible {
 }
 
 enum PAMLifecyclePhase: String, Codable {
+  case preparing
   case prepared
   case complete
   case restoring
+}
+
+struct PAMFileMetadata: Codable, Equatable {
+  let mode: UInt32
+  let ownerUserID: UInt32
+  let ownerGroupID: UInt32
+  let flags: UInt32
+  let extendedAttributes: [String: Data]
 }
 
 struct PAMLifecycleSnapshot: Codable, Equatable {
   let path: String
   let backupName: String
   let existed: Bool
+  let originalSHA256: String?
+  let metadata: PAMFileMetadata?
 }
 
 struct PAMLifecycleRecord: Codable, Equatable {
@@ -166,4 +185,6 @@ struct PAMLifecycleRecord: Codable, Equatable {
   let snapshots: [PAMLifecycleSnapshot]
   let installedPolicySHA256: String
   let installedModuleSHA256: String
+  var installedPolicyMetadata: PAMFileMetadata?
+  var installedModuleMetadata: PAMFileMetadata?
 }
