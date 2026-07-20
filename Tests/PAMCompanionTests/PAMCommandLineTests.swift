@@ -3,7 +3,7 @@ import XCTest
 @testable import PAMCompanionCore
 
 final class PAMCommandLineParserTests: XCTestCase {
-  func testReadOnlyCommandsParseWithoutRoot() throws {
+  func testInspectionCommandsParse() throws {
     XCTAssertEqual(try PAMCommandLineParser.parse(["pam-companion", "status"]), .status)
     XCTAssertEqual(try PAMCommandLineParser.parse(["pam-companion", "doctor"]), .doctor)
     XCTAssertEqual(try PAMCommandLineParser.parse(["pam-companion", "--version"]), .version)
@@ -36,9 +36,9 @@ final class PAMCommandLineParserTests: XCTestCase {
     }
   }
 
-  func testOnlyMutatingCommandsRequireRoot() throws {
-    XCTAssertFalse(try PAMCommandLineParser.parse(["pam-companion", "status"]).requiresRoot)
-    XCTAssertFalse(try PAMCommandLineParser.parse(["pam-companion", "doctor"]).requiresRoot)
+  func testSystemInspectionAndMutationCommandsRequireRoot() throws {
+    XCTAssertTrue(try PAMCommandLineParser.parse(["pam-companion", "status"]).requiresRoot)
+    XCTAssertTrue(try PAMCommandLineParser.parse(["pam-companion", "doctor"]).requiresRoot)
     XCTAssertTrue(try PAMCommandLineParser.parse(["pam-companion", "setup"]).requiresRoot)
     XCTAssertTrue(try PAMCommandLineParser.parse(["pam-companion", "restore"]).requiresRoot)
     XCTAssertTrue(

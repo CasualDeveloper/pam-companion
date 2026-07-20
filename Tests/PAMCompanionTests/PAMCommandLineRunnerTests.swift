@@ -4,12 +4,12 @@ import XCTest
 @testable import PAMCompanionCore
 
 final class PAMCommandLineRunnerTests: XCTestCase {
-  func testStatusIsReadOnlyAndReportsLegacyInstallation() {
+  func testRootStatusIsReadOnlyAndReportsLegacyInstallation() {
     let lifecycle = StubLifecycle(status: .legacy)
     let output = RecordingOutput()
     let runner = PAMCommandLineRunner(
       lifecycle: lifecycle,
-      effectiveUserID: 501,
+      effectiveUserID: 0,
       standardOutput: output.writeStandardOutput,
       standardError: output.writeStandardError
     )
@@ -26,7 +26,7 @@ final class PAMCommandLineRunnerTests: XCTestCase {
       let output = RecordingOutput()
       let runner = PAMCommandLineRunner(
         lifecycle: StubLifecycle(status: status),
-        effectiveUserID: 501,
+        effectiveUserID: 0,
         standardOutput: output.writeStandardOutput,
         standardError: output.writeStandardError
       )
@@ -38,12 +38,34 @@ final class PAMCommandLineRunnerTests: XCTestCase {
     let output = RecordingOutput()
     let runner = PAMCommandLineRunner(
       lifecycle: StubLifecycle(status: .configured),
-      effectiveUserID: 501,
+      effectiveUserID: 0,
       standardOutput: output.writeStandardOutput,
       standardError: output.writeStandardError
     )
     XCTAssertEqual(runner.run(["pam-companion", "doctor"]), 0)
     XCTAssertEqual(output.standardOutput, ["ok: pam_companion.so is installed and sudo_local is managed"])
+  }
+
+  func testInspectionRefusesNonRootWithoutReadingLifecycleState() {
+    let lifecycle = StubLifecycle(status: .configured)
+    let output = RecordingOutput()
+    let runner = PAMCommandLineRunner(
+      lifecycle: lifecycle,
+      effectiveUserID: 501,
+      standardOutput: output.writeStandardOutput,
+      standardError: output.writeStandardError
+    )
+
+    XCTAssertEqual(runner.run(["pam-companion", "status"]), 1)
+    XCTAssertEqual(runner.run(["pam-companion", "doctor"]), 1)
+    XCTAssertEqual(
+      output.standardError,
+      [
+        "pam-companion: this command must be run explicitly with sudo",
+        "pam-companion: this command must be run explicitly with sudo",
+      ]
+    )
+    XCTAssertEqual(lifecycle.statusCount, 0)
   }
 
   func testMutationRefusesNonRootWithoutCallingLifecycleManager() {
