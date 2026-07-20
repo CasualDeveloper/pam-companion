@@ -4,7 +4,7 @@ Release archives contain one universal `pam-companion` CLI and one universal `pa
 
 The project has no Apple Developer Program membership. Do not claim Developer ID identity, notarization, or Gatekeeper approval. Distribution integrity comes from the Homebrew formula digest, release checksums, GitHub provenance attestations, and verification of the exact archive.
 
-Release binaries are always compiled with Swiftly's Swift 6.3.3 toolchain. XCTest is supplied by the selected Xcode installation, so CI also runs the suite with each runner's recorded Xcode Swift toolchain on macOS 14, 15, and 26. This is an intentional two-toolchain matrix: declared-compiler release builds plus native-Xcode tests.
+Release binaries are always compiled in the macOS 26 packaging job with Swiftly's asserted Swift 6.3.3 toolchain. The compatibility matrix builds and tests with each runner's recorded native Xcode Swift toolchain on macOS 14, 15, and 26, then all three systems verify and load-smoke that one exact release archive. This is an intentional two-toolchain design: declared-compiler release packaging plus native-Xcode compatibility checks.
 
 ## Prepare a candidate
 
