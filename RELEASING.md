@@ -32,8 +32,8 @@ PAM mutations and authentication prompts are intentionally excluded from hosted 
 
 1. Record the current bytes, mode, owner, flags, and extended attributes of `/etc/pam.d/sudo_local` and any files under `/usr/local/lib/pam` named `pam_companion.so`, `pam_watchid.so`, or `pam_watchid.so.2`. Compare every xattr except `com.apple.provenance`, which macOS rewrites as a path-managed value during renames.
 2. Install the candidate through a temporary Homebrew formula whose URL and SHA-256 digest match the draft archive.
-3. Run `pam-companion status`, then `sudo pam-companion setup --dry-run`.
-4. Run `sudo pam-companion setup`; verify that legacy entries/files were migrated and `pam-companion doctor` passes.
+3. Run `sudo pam-companion status`, then `sudo pam-companion setup --dry-run`.
+4. Run `sudo pam-companion setup`; verify that legacy entries/files were migrated and `sudo pam-companion doctor` passes.
 5. In a new terminal, run `sudo -k; sudo true` and complete Touch ID or Apple Watch authentication.
 6. Run `sudo -k; sudo true`, cancel companion authentication, and verify the administrator password fallback still succeeds.
 7. Run `sudo pam-companion restore`; prove the captured tracked state was reconstructed, with only the documented `com.apple.provenance` exception.

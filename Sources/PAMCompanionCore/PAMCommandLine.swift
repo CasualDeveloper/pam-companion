@@ -9,8 +9,8 @@ public enum PAMCommand: Equatable, Sendable {
 
   public var requiresRoot: Bool {
     switch self {
-    case .setup, .restore, .uninstallPrepare: true
-    case .help, .version, .status, .doctor: false
+    case .status, .doctor, .setup, .restore, .uninstallPrepare: true
+    case .help, .version: false
     }
   }
 }

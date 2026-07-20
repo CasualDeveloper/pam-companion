@@ -243,6 +243,20 @@ final class PAMLifecycleManagerTests: XCTestCase {
     XCTAssertEqual(try system.snapshot(), before)
   }
 
+  func testConfiguredJournalIsRootPrivate() throws {
+    let system = try TemporaryPAMSystem()
+    defer { system.remove() }
+
+    _ = try system.manager().setup(dryRun: false)
+
+    XCTAssertEqual(try system.mode(system.paths.stateDirectory), 0o700)
+    XCTAssertEqual(
+      try system.mode(system.paths.stateDirectory.appendingPathComponent("record.json")),
+      0o600
+    )
+    XCTAssertEqual(try system.manager().status(), .configured)
+  }
+
   func testPreparedStateIsReportedAndCanBeRestoredAfterInterruption() throws {
     let system = try TemporaryPAMSystem()
     defer { system.remove() }

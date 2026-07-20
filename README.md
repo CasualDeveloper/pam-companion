@@ -8,7 +8,7 @@ The project has no daemon, network service, telemetry, or credential storage. ma
 
 ```sh
 brew install CasualDeveloper/tap/pam-companion
-pam-companion status
+sudo pam-companion status
 sudo pam-companion setup --dry-run
 sudo pam-companion setup
 ```
@@ -25,11 +25,13 @@ Setup is idempotent. It stops before mutation unless the system `sudo` policy ha
 
 Rollback validation covers bytes, ownership, permissions, flags, and every recorded extended attribute. The sole exception is Apple's opaque `com.apple.provenance` attribute: macOS rewrites that path-managed value during otherwise metadata-preserving renames, so it is neither recorded nor compared.
 
+The rollback journal is root-owned and accessible only to root. Inspection commands require explicit `sudo` so they can verify every supported policy mode without exposing saved metadata.
+
 ## Check, restore, and uninstall
 
 ```sh
-pam-companion status
-pam-companion doctor
+sudo pam-companion status
+sudo pam-companion doctor
 sudo pam-companion restore --dry-run
 sudo pam-companion restore
 ```
