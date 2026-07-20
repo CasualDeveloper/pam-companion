@@ -10,16 +10,21 @@ jobs:
   test:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
+    env:
+      DEVELOPER_DIR: ${{ matrix.developer_directory }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: macOS 26 Tahoe
             runner: macos-26
+            developer_directory: /Applications/Xcode.app/Contents/Developer
           - name: macOS 15 Sequoia
             runner: macos-15
+            developer_directory: /Applications/Xcode.app/Contents/Developer
           - name: macOS 14 Sonoma
             runner: macos-14
+            developer_directory: /Applications/Xcode_16.2.app/Contents/Developer
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
