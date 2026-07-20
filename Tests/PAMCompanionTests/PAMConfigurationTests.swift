@@ -85,6 +85,21 @@ final class PAMConfigurationPlannerTests: XCTestCase {
     }
   }
 
+  func testUnsafeControlFlagsFunctionsAndArgumentsAreRejected() {
+    let configurations: [(String, PAMConfigurationError)] = [
+      ("auth required pam_watchid.so\n", .unsupportedModuleEntry),
+      ("account sufficient pam_watchid.so\n", .unsupportedModuleEntry),
+      ("auth sufficient pam_watchid.so debug\n", .invalidModuleArguments),
+      ("auth sufficient pam_watchid.so timeout=0\n", .invalidModuleArguments),
+    ]
+
+    for (configuration, expected) in configurations {
+      XCTAssertThrowsError(try PAMConfigurationPlanner.plan(configuration)) { error in
+        XCTAssertEqual(error as? PAMConfigurationError, expected)
+      }
+    }
+  }
+
   func testInvalidUTF8AndNulBytesAreRejected() {
     XCTAssertThrowsError(try PAMConfigurationPlanner.plan(Data([0xff])))
     XCTAssertThrowsError(try PAMConfigurationPlanner.plan(Data("auth sufficient pam_tid.so\0\n".utf8)))
@@ -92,7 +107,7 @@ final class PAMConfigurationPlannerTests: XCTestCase {
 }
 
 final class PAMReferenceScannerTests: XCTestCase {
-  func testScannerFindsActiveLegacyReferencesIndependentlyOfFileNames() {
+  func testScannerFindsActiveLegacyReferencesIndependentlyOfFileNames() throws {
     let policies = [
       "/etc/pam.d/sudo_local": Data("auth sufficient pam_companion.so\n".utf8),
       "/etc/pam.d/custom": Data("auth required /usr/local/lib/pam/pam_watchid.so.2\n".utf8),
@@ -100,8 +115,14 @@ final class PAMReferenceScannerTests: XCTestCase {
     ]
 
     XCTAssertEqual(
-      PAMReferenceScanner.legacyReferences(in: policies),
+      try PAMReferenceScanner.legacyReferences(in: policies),
       [PAMLegacyReference(policyPath: "/etc/pam.d/custom", module: "pam_watchid.so.2")]
+    )
+  }
+
+  func testScannerRejectsUnparseablePolicies() {
+    XCTAssertThrowsError(
+      try PAMReferenceScanner.legacyReferences(in: ["/etc/pam.d/unknown": Data([0xff])])
     )
   }
 }
