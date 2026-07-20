@@ -4,7 +4,7 @@ public enum PAMConfigurationError: Error, Equatable, CustomStringConvertible {
   case invalidEncoding
   case duplicateModuleEntries
   case unsupportedModuleEntry
-  case invalidModuleArguments
+  case nativeModuleAnchorMissing
   case unsupportedLocalPolicy
 
   public var description: String {
@@ -15,8 +15,8 @@ public enum PAMConfigurationError: Error, Equatable, CustomStringConvertible {
       return "PAM configuration contains multiple companion module entries"
     case .unsupportedModuleEntry:
       return "companion module entries must use 'auth sufficient'"
-    case .invalidModuleArguments:
-      return "companion module entry contains unsupported arguments"
+    case .nativeModuleAnchorMissing:
+      return "sudo_local does not contain the system pam_tid.so template entry"
     case .unsupportedLocalPolicy:
       return
         "sudo_local contains an active entry outside the supported companion and Touch ID policy"
@@ -27,15 +27,17 @@ public enum PAMConfigurationError: Error, Equatable, CustomStringConvertible {
 public struct PAMConfigurationPlan: Equatable, Sendable {
   public let original: String
   public let updated: String
-  public let replacedLegacyModules: [String]
+  public let removedModules: [String]
 
   public var changed: Bool { original != updated }
 }
 
 public enum PAMConfigurationPlanner {
-  public static let canonicalModule = "pam_companion.so"
+  public static let nativeModule = "pam_tid.so"
+  public static let customModule = "pam_companion.so"
   public static let legacyModules = ["pam_watchid.so", "pam_watchid.so.2"]
-  public static let canonicalLine = "auth       sufficient     pam_companion.so"
+  public static let nativeLine = "auth       sufficient     pam_tid.so"
+  public static let removableModules = [customModule] + legacyModules
 
   public static func plan(_ data: Data) throws -> PAMConfigurationPlan {
     guard let configuration = String(data: data, encoding: .utf8), !data.contains(0) else {
@@ -50,65 +52,53 @@ public enum PAMConfigurationPlanner {
     }
 
     var lines = configuration.components(separatedBy: "\n")
-    var touchIDIndices: [Int] = []
+    var nativeIndices: [Int] = []
+    var commentedNativeIndices: [Int] = []
+    for (index, line) in lines.enumerated()
+    where commentedPolicyTokens(line) == ["auth", "sufficient", nativeModule] {
+      commentedNativeIndices.append(index)
+    }
     let matches = try lines.enumerated().compactMap { index, line -> ModuleEntry? in
       guard let tokens = policyTokens(line) else { return nil }
       guard tokens.count >= 3 else { throw PAMConfigurationError.unsupportedLocalPolicy }
       let module = moduleName(tokens[2])
-      if module == "pam_tid.so" {
-        guard tokens == ["auth", "sufficient", "pam_tid.so"] else {
+      if module == nativeModule {
+        guard tokens == ["auth", "sufficient", nativeModule] else {
           throw PAMConfigurationError.unsupportedLocalPolicy
         }
-        touchIDIndices.append(index)
+        nativeIndices.append(index)
         return nil
       }
-      guard module == canonicalModule || legacyModules.contains(module) else {
+      guard removableModules.contains(module) else {
         throw PAMConfigurationError.unsupportedLocalPolicy
       }
       guard tokens[0] == "auth", tokens[1] == "sufficient" else {
         throw PAMConfigurationError.unsupportedModuleEntry
       }
-      let arguments = Array(tokens.dropFirst(3))
-      guard (try? PAMModuleOptionParser.parse(arguments)) != nil else {
-        throw PAMConfigurationError.invalidModuleArguments
-      }
-      return ModuleEntry(index: index, module: module, arguments: arguments)
+      return ModuleEntry(index: index, module: module)
     }
 
     guard matches.count <= 1 else {
       throw PAMConfigurationError.duplicateModuleEntries
     }
-    guard touchIDIndices.count <= 1 else {
+    guard nativeIndices.count + commentedNativeIndices.count == 1 else {
+      if nativeIndices.isEmpty, commentedNativeIndices.isEmpty {
+        throw PAMConfigurationError.nativeModuleAnchorMissing
+      }
       throw PAMConfigurationError.unsupportedLocalPolicy
     }
-    if matches.first?.module == canonicalModule {
-      return PAMConfigurationPlan(
-        original: configuration,
-        updated: configuration,
-        replacedLegacyModules: []
-      )
+    if let commentedIndex = commentedNativeIndices.first {
+      lines[commentedIndex] = nativeLine
     }
-
-    var arguments: [String] = []
-    var replacedLegacyModules: [String] = []
-    if let legacy = matches.first {
-      arguments = legacy.arguments
-      replacedLegacyModules = [legacy.module]
-      lines.remove(at: legacy.index)
+    let removedModules = matches.map(\.module)
+    for entry in matches.sorted(by: { $0.index > $1.index }) {
+      lines.remove(at: entry.index)
     }
-
-    let insertionIndex =
-      lines.firstIndex(where: { line in
-        guard let tokens = policyTokens(line), tokens.count == 3 else { return false }
-        return tokens == ["auth", "sufficient", "pam_tid.so"]
-      }) ?? (lines.last == "" ? lines.count - 1 : lines.count)
-    let suffix = arguments.isEmpty ? "" : " " + arguments.joined(separator: " ")
-    lines.insert(canonicalLine + suffix, at: insertionIndex)
 
     return PAMConfigurationPlan(
       original: configuration,
       updated: lines.joined(separator: "\n"),
-      replacedLegacyModules: replacedLegacyModules
+      removedModules: removedModules
     )
   }
 }
@@ -128,15 +118,29 @@ public struct PAMLegacyReference: Equatable, Comparable, Sendable {
 }
 
 public enum PAMReferenceScanner {
-  public static func legacyReferences(in policies: [String: Data]) throws -> [PAMLegacyReference] {
+  public static func removableReferences(in policies: [String: Data]) throws
+    -> [PAMLegacyReference]
+  {
+    try references(in: policies, moduleIndex: 2)
+  }
+
+  public static func pamConfReferences(in policies: [String: Data]) throws
+    -> [PAMLegacyReference]
+  {
+    try references(in: policies, moduleIndex: 3)
+  }
+
+  private static func references(in policies: [String: Data], moduleIndex: Int) throws
+    -> [PAMLegacyReference]
+  {
     try policies.flatMap { path, data -> [PAMLegacyReference] in
       guard let content = String(data: data, encoding: .utf8), !data.contains(0) else {
         throw PAMConfigurationError.invalidEncoding
       }
       return content.components(separatedBy: "\n").compactMap { line in
-        guard let tokens = policyTokens(line), tokens.count >= 3 else { return nil }
-        let module = moduleName(tokens[2])
-        guard PAMConfigurationPlanner.legacyModules.contains(module) else { return nil }
+        guard let tokens = policyTokens(line), tokens.count > moduleIndex else { return nil }
+        let module = moduleName(tokens[moduleIndex])
+        guard PAMConfigurationPlanner.removableModules.contains(module) else { return nil }
         return PAMLegacyReference(policyPath: path, module: module)
       }
     }.sorted()
@@ -146,12 +150,19 @@ public enum PAMReferenceScanner {
 private struct ModuleEntry {
   let index: Int
   let module: String
-  let arguments: [String]
 }
 
 private func policyTokens(_ line: String) -> [String]? {
   let active = line.prefix { $0 != "#" }
   let tokens = active.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+  return tokens.isEmpty ? nil : tokens
+}
+
+private func commentedPolicyTokens(_ line: String) -> [String]? {
+  let trimmed = line.drop(while: { $0.isWhitespace })
+  guard trimmed.first == "#" else { return nil }
+  let comment = trimmed.dropFirst().drop(while: { $0.isWhitespace })
+  let tokens = comment.split(whereSeparator: { $0.isWhitespace }).map(String.init)
   return tokens.isEmpty ? nil : tokens
 }
 

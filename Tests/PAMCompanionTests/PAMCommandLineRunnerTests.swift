@@ -15,7 +15,10 @@ final class PAMCommandLineRunnerTests: XCTestCase {
     )
 
     XCTAssertEqual(runner.run(["pam-companion", "status"]), 0)
-    XCTAssertEqual(output.standardOutput, ["legacy: pam_watchid installation detected"])
+    XCTAssertEqual(
+      output.standardOutput,
+      ["migration needed: custom or legacy PAM integration detected"]
+    )
     XCTAssertEqual(lifecycle.mutationCount, 0)
   }
 
@@ -43,7 +46,7 @@ final class PAMCommandLineRunnerTests: XCTestCase {
       standardError: output.writeStandardError
     )
     XCTAssertEqual(runner.run(["pam-companion", "doctor"]), 0)
-    XCTAssertEqual(output.standardOutput, ["ok: pam_companion.so is installed and sudo_local is managed"])
+    XCTAssertEqual(output.standardOutput, ["ok: pam_tid.so is enabled and sudo_local is managed"])
   }
 
   func testInspectionRefusesNonRootWithoutReadingLifecycleState() {
@@ -79,7 +82,8 @@ final class PAMCommandLineRunnerTests: XCTestCase {
     )
 
     XCTAssertEqual(runner.run(["pam-companion", "setup"]), 1)
-    XCTAssertEqual(output.standardError, ["pam-companion: this command must be run explicitly with sudo"])
+    XCTAssertEqual(
+      output.standardError, ["pam-companion: this command must be run explicitly with sudo"])
     XCTAssertEqual(lifecycle.mutationCount, 0)
   }
 
@@ -111,7 +115,7 @@ final class PAMCommandLineRunnerTests: XCTestCase {
     )
 
     XCTAssertEqual(runner.run(["pam-companion", "--version"]), 0)
-    XCTAssertEqual(output.standardOutput, ["pam-companion 0.1.0"])
+    XCTAssertEqual(output.standardOutput, ["pam-companion 0.1.1"])
     XCTAssertEqual(runner.run(["pam-companion", "unknown"]), 2)
     XCTAssertEqual(lifecycle.statusCount, 0)
   }

@@ -6,7 +6,6 @@ struct PAMLifecycleFileSystem {
   let expectedOwnerUserID: uid_t
   let expectedOwnerGroupID: gid_t
   private let fileManager = FileManager.default
-  private let maximumModuleSize = 64 * 1024 * 1024
 
   func exists(_ url: URL) -> Bool {
     var info = stat()
@@ -67,6 +66,42 @@ struct PAMLifecycleFileSystem {
     }
   }
 
+  func isRecoverablePreJournalStateDirectory(_ url: URL) throws -> Bool {
+    try validateStateDirectory(url)
+    let children: [URL]
+    do {
+      children = try fileManager.contentsOfDirectory(
+        at: url,
+        includingPropertiesForKeys: nil,
+        options: []
+      )
+    } catch {
+      throw fileSystemError(url.path)
+    }
+    for child in children {
+      let prefix = ".pam-companion."
+      guard child.lastPathComponent.hasPrefix(prefix),
+        UUID(uuidString: String(child.lastPathComponent.dropFirst(prefix.count))) != nil
+      else {
+        return false
+      }
+      var info = stat()
+      guard lstat(child.path, &info) == 0 else { throw fileSystemError(child.path) }
+      guard info.st_mode & S_IFMT == S_IFREG,
+        info.st_uid == expectedOwnerUserID,
+        info.st_gid == expectedOwnerGroupID,
+        info.st_mode & 0o022 == 0,
+        info.st_nlink == 1,
+        info.st_size <= 1024 * 1024,
+        !hasUnsafeFlags(info),
+        try !hasExtendedACL(child.path)
+      else {
+        throw PAMLifecycleError.unsafePath(child.path)
+      }
+    }
+    return true
+  }
+
   func validateRecordFile(_ url: URL) throws {
     try validateAncestors(of: url)
     var info = stat()
@@ -83,69 +118,13 @@ struct PAMLifecycleFileSystem {
     }
   }
 
-  func readSourceModule(_ url: URL) throws -> Data {
-    try validateAncestors(of: url, requiresPrivilegedOwnership: false)
-    let descriptor = open(url.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
-    guard descriptor >= 0 else { throw fileSystemError(url.path) }
-    defer { close(descriptor) }
-    var info = stat()
-    guard fstat(descriptor, &info) == 0 else { throw fileSystemError(url.path) }
-    guard info.st_mode & S_IFMT == S_IFREG,
-      info.st_mode & 0o022 == 0,
-      info.st_nlink == 1,
-      info.st_size > 0,
-      info.st_size <= maximumModuleSize,
-      !hasUnsafeFlags(info),
-      try !hasExtendedACL(descriptor)
-    else {
-      throw PAMLifecycleError.unsafePath(url.path)
-    }
-    var data = Data(count: Int(info.st_size))
-    let total = data.count
-    var offset = 0
-    while offset < total {
-      let count = data.withUnsafeMutableBytes { bytes in
-        Darwin.pread(
-          descriptor,
-          bytes.baseAddress?.advanced(by: offset),
-          total - offset,
-          off_t(offset)
-        )
-      }
-      guard count > 0 else { throw fileSystemError(url.path) }
-      offset += count
-    }
-    return data
-  }
-
-  func withTemporaryModule<T>(_ data: Data, operation: (URL) throws -> T) throws -> T {
-    var template = Array("/var/tmp/pam-companion.validate.XXXXXX".utf8CString)
-    let descriptor = mkstemp(&template)
-    guard descriptor >= 0 else { throw fileSystemError("/var/tmp") }
-    let path = String(
-      decoding: template.prefix { $0 != 0 }.map(UInt8.init(bitPattern:)), as: UTF8.self)
-    let url = URL(fileURLWithPath: path)
-    defer {
-      close(descriptor)
-      _ = unlink(url.path)
-    }
-    guard fchmod(descriptor, 0o400) == 0,
-      fchown(descriptor, expectedOwnerUserID, expectedOwnerGroupID) == 0
-    else {
-      throw fileSystemError(url.path)
-    }
-    try write(data, to: descriptor, path: url.path)
-    guard fsync(descriptor) == 0 else { throw fileSystemError(url.path) }
-    return try operation(url)
-  }
-
   func policyFiles(in directory: URL) throws -> [String: Data] {
     let urls: [URL]
     do {
       urls = try fileManager.contentsOfDirectory(
         at: directory,
         includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
-        options: [.skipsHiddenFiles]
+        options: []
       )
     } catch {
       throw fileSystemError(directory.path)
@@ -201,7 +180,6 @@ struct PAMLifecycleFileSystem {
     let target = URL(fileURLWithPath: snapshot.path)
     let backup = backupURL(for: snapshot)
     try validateStateDirectory(stateDirectory)
-    try validateAncestors(of: target)
     if !snapshot.existed {
       guard !exists(backup) else {
         throw PAMLifecycleError.invalidState("unexpected backup: \(snapshot.backupName)")
@@ -209,6 +187,7 @@ struct PAMLifecycleFileSystem {
       guard !exists(target) else { throw PAMLifecycleError.managedStateDrift(snapshot.path) }
       return
     }
+    try validateAncestors(of: target)
     if exists(backup) {
       try validateOriginal(snapshot, at: backup)
       return
@@ -322,8 +301,8 @@ struct PAMLifecycleFileSystem {
     let target = URL(fileURLWithPath: snapshot.path)
     let backup = backupURL(for: snapshot)
     try validateStateDirectory(stateDirectory)
-    try validateAncestors(of: target)
     if snapshot.existed {
+      try validateAncestors(of: target)
       if exists(backup) {
         try validateOriginal(snapshot, at: backup)
         guard rename(backup.path, target.path) == 0 else { throw fileSystemError(target.path) }
@@ -338,6 +317,7 @@ struct PAMLifecycleFileSystem {
         throw PAMLifecycleError.invalidState("unexpected backup: \(snapshot.backupName)")
       }
       guard exists(target) else { return }
+      try validateAncestors(of: target)
       try validateRegularRootTarget(target)
       do {
         try fileManager.removeItem(at: target)
@@ -421,7 +401,7 @@ struct PAMLifecycleFileSystem {
     } catch {
       throw PAMLifecycleError.invalidState("record could not be decoded")
     }
-    guard record.schemaVersion == 2 else {
+    guard record.schemaVersion == 2 || record.schemaVersion == 3 else {
       throw PAMLifecycleError.invalidState("unsupported schema version")
     }
     return record.normalizingTrackedExtendedAttributes()
@@ -532,10 +512,7 @@ struct PAMLifecycleFileSystem {
     guard fsync(descriptor) == 0 else { throw fileSystemError(url.path) }
   }
 
-  private func validateAncestors(
-    of url: URL,
-    requiresPrivilegedOwnership: Bool = true
-  ) throws {
+  private func validateAncestors(of url: URL) throws {
     let parentPath = url.deletingLastPathComponent().path
     guard let resolved = realpath(parentPath, nil) else { throw fileSystemError(parentPath) }
     defer { free(resolved) }
@@ -545,14 +522,14 @@ struct PAMLifecycleFileSystem {
       relativeTo: nil
     )
     var current = URL(fileURLWithPath: "/", isDirectory: true)
-    try validateAncestor(current, requiresPrivilegedOwnership: requiresPrivilegedOwnership)
+    try validateAncestor(current)
     for component in parent.pathComponents.dropFirst() {
       current.appendPathComponent(component, isDirectory: true)
-      try validateAncestor(current, requiresPrivilegedOwnership: requiresPrivilegedOwnership)
+      try validateAncestor(current)
     }
   }
 
-  private func validateAncestor(_ url: URL, requiresPrivilegedOwnership: Bool) throws {
+  private func validateAncestor(_ url: URL) throws {
     var info = stat()
     guard lstat(url.path, &info) == 0 else { throw fileSystemError(url.path) }
     let hasTrustedOwnership =
@@ -561,8 +538,8 @@ struct PAMLifecycleFileSystem {
     guard info.st_mode & S_IFMT == S_IFDIR,
       !hasUnsafeFlags(info),
       try !hasExtendedACL(url.path),
-      !requiresPrivilegedOwnership
-        || (hasTrustedOwnership && info.st_mode & 0o022 == 0)
+      hasTrustedOwnership,
+      info.st_mode & 0o022 == 0
     else {
       throw PAMLifecycleError.unsafePath(url.path)
     }

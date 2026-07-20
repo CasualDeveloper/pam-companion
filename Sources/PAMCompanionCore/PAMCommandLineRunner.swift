@@ -1,7 +1,7 @@
 import Darwin
 
 public enum PAMCompanionVersion {
-  public static let current = "0.1.0"
+  public static let current = "0.1.1"
 }
 
 public struct PAMCommandLineRunner {
@@ -60,7 +60,7 @@ public struct PAMCommandLineRunner {
 
   private func doctor(_ status: PAMLifecycleStatus) -> Int32 {
     if status == .configured {
-      standardOutput("ok: pam_companion.so is installed and sudo_local is managed")
+      standardOutput("ok: pam_tid.so is enabled and sudo_local is managed")
       return 0
     }
     standardError("error: \(statusLine(status))")
@@ -70,9 +70,9 @@ public struct PAMCommandLineRunner {
   private func statusLine(_ status: PAMLifecycleStatus) -> String {
     switch status {
     case .notConfigured: "not configured: run sudo pam-companion setup"
-    case .legacy: "legacy: pam_watchid installation detected"
-    case .configured: "configured: pam_companion.so is managed"
-    case .unmanaged: "unmanaged: companion files exist without lifecycle state"
+    case .legacy: "migration needed: custom or legacy PAM integration detected"
+    case .configured: "configured: native pam_tid.so is managed"
+    case .unmanaged: "unmanaged: pam_tid.so is enabled outside pam-companion"
     case .recoveryRequired: "recovery required: run sudo pam-companion restore"
     case .drifted: "drifted: managed PAM files changed after setup"
     }
@@ -83,7 +83,7 @@ public struct PAMCommandLineRunner {
 
       status                  Show the current PAM integration state
       doctor                  Check whether the managed integration is healthy
-      setup [--dry-run]       Install and enable pam_companion.so (requires sudo)
+      setup [--dry-run]       Enable and manage native pam_tid.so (requires sudo)
       restore [--dry-run]     Restore the pre-setup PAM state (requires sudo)
       uninstall --prepare     Restore PAM before Homebrew removal (requires sudo)
       --version               Print the version

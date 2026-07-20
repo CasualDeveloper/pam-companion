@@ -9,19 +9,9 @@ let package = Package(
     .executable(
       name: "pam-companion",
       targets: ["PAMCompanionCLI"]
-    ),
-    .library(
-      name: "PAMCompanionModule",
-      type: .dynamic,
-      targets: ["PAMCompanion"]
     )
   ],
   targets: [
-    .target(
-      name: "CPAM",
-      path: "Sources/CPAM",
-      publicHeadersPath: "include"
-    ),
     .target(
       name: "PAMCompanionCore",
       path: "Sources/PAMCompanionCore"
@@ -31,14 +21,9 @@ let package = Package(
       dependencies: ["PAMCompanionCore"],
       path: "Sources/PAMCompanionCLI"
     ),
-    .target(
-      name: "PAMCompanion",
-      dependencies: ["CPAM", "PAMCompanionCore"],
-      path: "Sources/PAMCompanion"
-    ),
     .testTarget(
       name: "PAMCompanionTests",
-      dependencies: ["CPAM", "PAMCompanion", "PAMCompanionCore"],
+      dependencies: ["PAMCompanionCore"],
       path: "Tests/PAMCompanionTests"
     ),
   ],

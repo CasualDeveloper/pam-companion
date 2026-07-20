@@ -3,41 +3,49 @@ import Foundation
 
 public struct PAMLifecyclePaths: Equatable, Sendable {
   public let policyDirectory: URL
+  public let pamConf: URL
   public let sudoPolicy: URL
   public let sudoLocal: URL
-  public let moduleSource: URL
+  public let localPolicyDirectory: URL
+  public let localPamConf: URL
   public let moduleDirectory: URL
   public let stateDirectory: URL
 
   public init(
     policyDirectory: URL,
+    pamConf: URL,
     sudoPolicy: URL,
     sudoLocal: URL,
-    moduleSource: URL,
+    localPolicyDirectory: URL,
+    localPamConf: URL,
     moduleDirectory: URL,
     stateDirectory: URL
   ) {
     self.policyDirectory = policyDirectory
+    self.pamConf = pamConf
     self.sudoPolicy = sudoPolicy
     self.sudoLocal = sudoLocal
-    self.moduleSource = moduleSource
+    self.localPolicyDirectory = localPolicyDirectory
+    self.localPamConf = localPamConf
     self.moduleDirectory = moduleDirectory
     self.stateDirectory = stateDirectory
   }
 
-  public static func system(moduleSource: URL) -> PAMLifecyclePaths {
+  public static func system() -> PAMLifecyclePaths {
     PAMLifecyclePaths(
       policyDirectory: URL(fileURLWithPath: "/etc/pam.d"),
+      pamConf: URL(fileURLWithPath: "/etc/pam.conf"),
       sudoPolicy: URL(fileURLWithPath: "/etc/pam.d/sudo"),
       sudoLocal: URL(fileURLWithPath: "/etc/pam.d/sudo_local"),
-      moduleSource: moduleSource,
+      localPolicyDirectory: URL(fileURLWithPath: "/usr/local/etc/pam.d"),
+      localPamConf: URL(fileURLWithPath: "/usr/local/etc/pam.conf"),
       moduleDirectory: URL(fileURLWithPath: "/usr/local/lib/pam"),
       stateDirectory: URL(fileURLWithPath: "/var/db/pam-companion")
     )
   }
 
-  public var canonicalModule: URL {
-    moduleDirectory.appendingPathComponent(PAMConfigurationPlanner.canonicalModule)
+  public var customModule: URL {
+    moduleDirectory.appendingPathComponent(PAMConfigurationPlanner.customModule)
   }
 
   public var legacyModule: URL {
@@ -81,7 +89,6 @@ public protocol PAMLifecycleManaging: AnyObject {
 enum PAMLifecycleFailurePoint: String, CaseIterable, Codable, Sendable {
   case afterStatePrepared
   case afterCanonicalBackedUp
-  case afterModuleInstalled
   case afterPolicyBackedUp
   case afterPolicyInstalled
   case afterLegacyBackedUp
@@ -96,10 +103,9 @@ enum PAMLifecycleFailurePoint: String, CaseIterable, Codable, Sendable {
 
   static let setupCases: [Self] = [
     .afterStatePrepared,
-    .afterCanonicalBackedUp,
-    .afterModuleInstalled,
     .afterPolicyBackedUp,
     .afterPolicyInstalled,
+    .afterCanonicalBackedUp,
     .afterLegacyBackedUp,
     .afterVersionedLegacyBackedUp,
     .afterLegacyRemoved,
@@ -123,7 +129,6 @@ public enum PAMLifecycleError: Error, Equatable, CustomStringConvertible {
   case recoveryRequired
   case unsafePath(String)
   case invalidState(String)
-  case moduleValidation(String)
   case fileSystem(path: String, message: String)
   case rollbackFailed(String)
   case injectedFailure(String)
@@ -144,8 +149,6 @@ public enum PAMLifecycleError: Error, Equatable, CustomStringConvertible {
       return "refusing an unsafe filesystem target: \(path)"
     case .invalidState(let detail):
       return "invalid lifecycle state: \(detail)"
-    case .moduleValidation(let detail):
-      return "invalid pam_companion.so release module: \(detail)"
     case .fileSystem(let path, let message):
       return "filesystem operation failed at \(path): \(message)"
     case .rollbackFailed(let detail):
@@ -212,7 +215,7 @@ struct PAMLifecycleRecord: Codable, Equatable {
   var phase: PAMLifecyclePhase
   let snapshots: [PAMLifecycleSnapshot]
   let installedPolicySHA256: String
-  let installedModuleSHA256: String
+  let installedModuleSHA256: String?
   var installedPolicyMetadata: PAMFileMetadata?
   var installedModuleMetadata: PAMFileMetadata?
 

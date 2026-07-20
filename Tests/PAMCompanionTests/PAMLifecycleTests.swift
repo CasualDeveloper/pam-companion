@@ -78,9 +78,9 @@ final class PAMLifecycleManagerTests: XCTestCase {
     XCTAssertTrue(setup.changed)
     XCTAssertEqual(
       try system.string(system.paths.sudoLocal),
-      "# local policy\nauth       sufficient     pam_companion.so\nauth       sufficient     pam_tid.so\n"
+      "# local policy\nauth       sufficient     pam_tid.so\n"
     )
-    XCTAssertEqual(try system.read(system.paths.canonicalModule), system.moduleBytes)
+    XCTAssertFalse(system.exists(system.paths.customModule))
     XCTAssertFalse(system.exists(system.paths.legacyVersionedModule))
     XCTAssertEqual(try system.mode(system.paths.sudoLocal), originalMode)
     XCTAssertEqual(
@@ -104,7 +104,7 @@ final class PAMLifecycleManagerTests: XCTestCase {
       try system.extendedAttribute(name: "dev.authcompanion.test", on: system.paths.sudoLocal),
       attribute
     )
-    XCTAssertFalse(system.exists(system.paths.canonicalModule))
+    XCTAssertFalse(system.exists(system.paths.customModule))
     XCTAssertFalse(system.exists(system.paths.stateDirectory))
     XCTAssertEqual(try manager.status(), .legacy)
   }
@@ -120,18 +120,126 @@ final class PAMLifecycleManagerTests: XCTestCase {
     XCTAssertEqual(try system.snapshot(), before)
   }
 
-  func testSetupInstallsTheExactModuleBytesValidatedFromOneDescriptor() throws {
+  func testSetupDoesNotRequireOrCreateAThirdPartyModuleDirectory() throws {
+    let system = try TemporaryPAMSystem(legacyInstallation: false)
+    defer { system.remove() }
+    let originalPolicy = try system.read(system.paths.sudoLocal)
+    XCTAssertFalse(system.exists(system.paths.moduleDirectory))
+
+    XCTAssertTrue(try system.manager().setup(dryRun: false).changed)
+
+    XCTAssertEqual(
+      try system.string(system.paths.sudoLocal),
+      "# local policy\nauth       sufficient     pam_tid.so\n"
+    )
+    XCTAssertFalse(system.exists(system.paths.moduleDirectory))
+
+    XCTAssertTrue(try system.manager().restore(dryRun: false).changed)
+    XCTAssertEqual(try system.read(system.paths.sudoLocal), originalPolicy)
+    XCTAssertFalse(system.exists(system.paths.moduleDirectory))
+  }
+
+  func testSetupRemovesTheCustomModuleAndRestoresItExactly() throws {
     let system = try TemporaryPAMSystem()
     defer { system.remove() }
-    let replacement = Data("path was replaced after validation began".utf8)
-    let manager = system.manager(moduleValidator: { _ in
-      try system.replaceModuleSource(with: replacement)
-    })
+    let originalPolicy =
+      "# local policy\n#auth sufficient pam_tid.so\nauth sufficient pam_companion.so\n"
+    try system.write(originalPolicy, to: system.paths.sudoLocal)
+    try system.installCustomModule()
+    let originalModule = try system.read(system.paths.customModule)
+    let manager = system.manager()
 
     _ = try manager.setup(dryRun: false)
 
-    XCTAssertEqual(try system.read(system.paths.canonicalModule), system.moduleBytes)
-    XCTAssertEqual(try system.read(system.paths.moduleSource), replacement)
+    XCTAssertEqual(
+      try system.string(system.paths.sudoLocal),
+      "# local policy\nauth       sufficient     pam_tid.so\n"
+    )
+    XCTAssertFalse(system.exists(system.paths.customModule))
+
+    _ = try manager.restore(dryRun: false)
+
+    XCTAssertEqual(try system.string(system.paths.sudoLocal), originalPolicy)
+    XCTAssertEqual(try system.read(system.paths.customModule), originalModule)
+  }
+
+  func testSetupMigratesCompleteSchemaTwoInstallAndPreservesOriginalRestorePoint() throws {
+    let system = try TemporaryPAMSystem()
+    defer { system.remove() }
+    let originalPolicy = "# local policy\n#auth       sufficient     pam_tid.so\n"
+    try system.write(originalPolicy, to: system.paths.sudoLocal)
+    try system.installCompleteSchemaTwoSetup()
+    let manager = system.manager()
+
+    XCTAssertEqual(try manager.status(), .legacy)
+    XCTAssertTrue(try manager.setup(dryRun: false).changed)
+
+    XCTAssertEqual(
+      try system.string(system.paths.sudoLocal),
+      "# local policy\nauth       sufficient     pam_tid.so\n"
+    )
+    XCTAssertFalse(system.exists(system.paths.customModule))
+    let upgraded = try system.fileSystem.readRecord(
+      from: system.paths.stateDirectory.appendingPathComponent("record.json"))
+    XCTAssertEqual(upgraded.schemaVersion, 3)
+    XCTAssertNil(upgraded.installedModuleSHA256)
+    XCTAssertEqual(try manager.status(), .configured)
+
+    XCTAssertTrue(try manager.restore(dryRun: false).changed)
+    XCTAssertEqual(try system.string(system.paths.sudoLocal), originalPolicy)
+    XCTAssertFalse(system.exists(system.paths.customModule))
+  }
+
+  func testSchemaTwoMigrationPreflightsExternalReferencesBeforeRestoring() throws {
+    let system = try TemporaryPAMSystem()
+    defer { system.remove() }
+    let originalPolicy = "# local policy\n#auth       sufficient     pam_tid.so\n"
+    try system.write(originalPolicy, to: system.paths.sudoLocal)
+    try system.installCompleteSchemaTwoSetup()
+    try system.write(
+      "auth required /usr/local/lib/pam/pam_companion.so\n",
+      to: system.paths.policyDirectory.appendingPathComponent("custom")
+    )
+    let before = try system.snapshot()
+
+    XCTAssertThrowsError(try system.manager().setup(dryRun: false)) { error in
+      XCTAssertEqual(
+        error as? PAMLifecycleError,
+        .legacyModuleStillReferenced("pam_companion.so", policy: "custom")
+      )
+    }
+    XCTAssertEqual(try system.snapshot(), before)
+  }
+
+  func testSchemaTwoMigrationPreflightsPasswordFallbackBeforeRestoring() throws {
+    let system = try TemporaryPAMSystem()
+    defer { system.remove() }
+    let originalPolicy = "# local policy\n#auth       sufficient     pam_tid.so\n"
+    try system.write(originalPolicy, to: system.paths.sudoLocal)
+    try system.installCompleteSchemaTwoSetup()
+    try system.write("auth include sudo_local\n", to: system.paths.sudoPolicy)
+    let before = try system.snapshot()
+
+    XCTAssertThrowsError(try system.manager().setup(dryRun: false)) { error in
+      XCTAssertEqual(error as? PAMLifecycleError, .passwordFallbackUnavailable)
+    }
+    XCTAssertEqual(try system.snapshot(), before)
+  }
+
+  func testSchemaTwoMigrationIgnoresItsOwnPreservedPolicyBackup() throws {
+    let system = try TemporaryPAMSystem()
+    defer { system.remove() }
+    let originalPolicy = try system.read(system.paths.sudoLocal)
+    try system.installCompleteSchemaTwoSetup()
+    let manager = system.manager()
+
+    XCTAssertEqual(try manager.status(), .legacy)
+    XCTAssertTrue(try manager.setup(dryRun: false).changed)
+    XCTAssertEqual(try manager.status(), .configured)
+
+    XCTAssertTrue(try manager.restore(dryRun: false).changed)
+    XCTAssertEqual(try system.read(system.paths.sudoLocal), originalPolicy)
+    XCTAssertEqual(try system.read(system.paths.legacyVersionedModule), system.legacyBytes)
   }
 
   func testSetupRequiresExplicitRootExecution() throws {
@@ -207,6 +315,53 @@ final class PAMLifecycleManagerTests: XCTestCase {
     XCTAssertEqual(try system.snapshot(), before)
   }
 
+  func testSetupRefusesToRemoveCustomModuleReferencedByAnotherPolicy() throws {
+    let system = try TemporaryPAMSystem()
+    defer { system.remove() }
+    try system.installCustomModule()
+    try system.write(
+      "auth required /usr/local/lib/pam/pam_companion.so\n",
+      to: system.paths.policyDirectory.appendingPathComponent("custom")
+    )
+    let before = try system.snapshot()
+
+    XCTAssertThrowsError(try system.manager().setup(dryRun: false)) { error in
+      XCTAssertEqual(
+        error as? PAMLifecycleError,
+        .legacyModuleStillReferenced("pam_companion.so", policy: "custom")
+      )
+    }
+    XCTAssertEqual(try system.snapshot(), before)
+  }
+
+  func testSetupScansEveryMacOSPAMPolicyLocationBeforeRemovingCustomModule() throws {
+    let cases: [((PAMLifecyclePaths) -> URL, String)] = [
+      ({ $0.pamConf }, "custom-service auth required pam_companion.so\n"),
+      ({ $0.localPamConf }, "custom-service auth required pam_companion.so\n"),
+      (
+        { $0.localPolicyDirectory.appendingPathComponent("custom-service") },
+        "auth required pam_companion.so\n"
+      ),
+    ]
+
+    for (path, policy) in cases {
+      let system = try TemporaryPAMSystem()
+      defer { system.remove() }
+      try system.installCustomModule()
+      let policyURL = path(system.paths)
+      try system.write(policy, to: policyURL)
+      let before = try system.snapshot()
+
+      XCTAssertThrowsError(try system.manager().setup(dryRun: false), policyURL.path) { error in
+        XCTAssertEqual(
+          error as? PAMLifecycleError,
+          .legacyModuleStillReferenced("pam_companion.so", policy: policyURL.lastPathComponent)
+        )
+      }
+      XCTAssertEqual(try system.snapshot(), before)
+    }
+  }
+
   func testEveryInjectedSetupFailureRollsBackTrackedState() throws {
     for point in PAMLifecycleFailurePoint.setupCases {
       let system = try TemporaryPAMSystem()
@@ -241,6 +396,31 @@ final class PAMLifecycleManagerTests: XCTestCase {
 
     XCTAssertFalse(second.changed)
     XCTAssertEqual(try system.snapshot(), before)
+  }
+
+  func testConfiguredStatusAndIdempotentSetupDetectPasswordFallbackDrift() throws {
+    let system = try TemporaryPAMSystem()
+    defer { system.remove() }
+    let manager = system.manager()
+    _ = try manager.setup(dryRun: false)
+    try system.write("auth include sudo_local\n", to: system.paths.sudoPolicy)
+
+    XCTAssertEqual(try manager.status(), .drifted)
+    XCTAssertThrowsError(try manager.setup(dryRun: false)) { error in
+      XCTAssertEqual(error as? PAMLifecycleError, .passwordFallbackUnavailable)
+    }
+  }
+
+  func testConfiguredStatusRefusesAnUnsafePasswordFallbackPolicyFile() throws {
+    let system = try TemporaryPAMSystem()
+    defer { system.remove() }
+    let manager = system.manager()
+    _ = try manager.setup(dryRun: false)
+    XCTAssertEqual(chmod(system.paths.sudoPolicy.path, 0o666), 0)
+
+    XCTAssertThrowsError(try manager.status()) { error in
+      XCTAssertEqual(error as? PAMLifecycleError, .unsafePath(system.paths.sudoPolicy.path))
+    }
   }
 
   func testConfiguredJournalIsRootPrivate() throws {
@@ -278,7 +458,7 @@ final class PAMLifecycleManagerTests: XCTestCase {
     try fileSystem.createStateDirectory(system.paths.stateDirectory)
     let targets = [
       (system.paths.sudoLocal, system.backupName(for: system.paths.sudoLocal)),
-      (system.paths.canonicalModule, system.backupName(for: system.paths.canonicalModule)),
+      (system.paths.customModule, system.backupName(for: system.paths.customModule)),
       (system.paths.legacyModule, system.backupName(for: system.paths.legacyModule)),
       (
         system.paths.legacyVersionedModule,
@@ -304,13 +484,49 @@ final class PAMLifecycleManagerTests: XCTestCase {
     )
     try fileSystem.stageModule(
       system.moduleBytes,
-      at: system.stagedURL(for: system.paths.canonicalModule)
+      at: system.stagedURL(for: system.paths.customModule)
     )
 
     let manager = system.manager()
     XCTAssertEqual(try manager.status(), .recoveryRequired)
     XCTAssertTrue(try manager.restore(dryRun: false).changed)
     XCTAssertEqual(try system.snapshot(), before)
+  }
+
+  func testEmptyPreJournalStateDirectoryHasAnExplicitRecoveryPath() throws {
+    let system = try TemporaryPAMSystem(legacyInstallation: false)
+    defer { system.remove() }
+    let before = try system.snapshot()
+    try system.fileSystem.createStateDirectory(system.paths.stateDirectory)
+    let manager = system.manager()
+
+    XCTAssertEqual(try manager.status(), .recoveryRequired)
+    XCTAssertThrowsError(try manager.setup(dryRun: false)) { error in
+      XCTAssertEqual(error as? PAMLifecycleError, .recoveryRequired)
+    }
+    XCTAssertTrue(try manager.restore(dryRun: true).changed)
+    XCTAssertTrue(system.exists(system.paths.stateDirectory))
+
+    XCTAssertTrue(try manager.restore(dryRun: false).changed)
+    XCTAssertEqual(try system.snapshot(), before)
+    XCTAssertEqual(try manager.status(), .notConfigured)
+  }
+
+  func testPartialRecordTemporaryFileHasAnExplicitRecoveryPath() throws {
+    let system = try TemporaryPAMSystem(legacyInstallation: false)
+    defer { system.remove() }
+    let before = try system.snapshot()
+    try system.fileSystem.createStateDirectory(system.paths.stateDirectory)
+    let partialRecord = system.paths.stateDirectory.appendingPathComponent(
+      ".pam-companion.\(UUID().uuidString)")
+    try Data("partial journal".utf8).write(to: partialRecord)
+    XCTAssertEqual(chmod(partialRecord.path, 0o600), 0)
+    let manager = system.manager()
+
+    XCTAssertEqual(try manager.status(), .recoveryRequired)
+    XCTAssertTrue(try manager.restore(dryRun: false).changed)
+    XCTAssertEqual(try system.snapshot(), before)
+    XCTAssertEqual(try manager.status(), .notConfigured)
   }
 
   func testRestoreResumesAfterEveryDurableRestoreFailurePoint() throws {
@@ -389,7 +605,7 @@ final class PAMLifecycleManagerTests: XCTestCase {
   func testOrphanedLifecycleSiblingIsRejectedWithoutAJournal() throws {
     let system = try TemporaryPAMSystem()
     defer { system.remove() }
-    let orphan = system.stagedURL(for: system.paths.canonicalModule)
+    let orphan = system.stagedURL(for: system.paths.customModule)
     try system.moduleBytes.write(to: orphan)
 
     XCTAssertThrowsError(try system.manager().status()) { error in
@@ -490,23 +706,6 @@ final class PAMLifecycleManagerTests: XCTestCase {
   }
 }
 
-final class SystemPAMModuleValidatorTests: XCTestCase {
-  func testRequiresAdHocHardenedRuntimeSignatureDetails() throws {
-    XCTAssertNoThrow(
-      try SystemPAMModuleValidator.validateSignatureDetails(
-        "Signature=adhoc\nCodeDirectory v=20500 flags=0x10002(adhoc,runtime)\n"
-      )
-    )
-    let rejected = [
-      "Signature=adhoc\nCodeDirectory v=20500 flags=0x2(adhoc)\n",
-      "Authority=Developer ID Application: Example\nCodeDirectory flags=0x10000(runtime)\n",
-    ]
-    for details in rejected {
-      XCTAssertThrowsError(try SystemPAMModuleValidator.validateSignatureDetails(details))
-    }
-  }
-}
-
 private final class TemporaryPAMSystem {
   let root: URL
   let paths: PAMLifecyclePaths
@@ -518,22 +717,24 @@ private final class TemporaryPAMSystem {
     PAMLifecycleFileSystem(expectedOwnerUserID: getuid(), expectedOwnerGroupID: getgid())
   }
 
-  init() throws {
+  init(legacyInstallation: Bool = true) throws {
     root = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     paths = PAMLifecyclePaths(
       policyDirectory: root.appendingPathComponent("etc/pam.d"),
+      pamConf: root.appendingPathComponent("etc/pam.conf"),
       sudoPolicy: root.appendingPathComponent("etc/pam.d/sudo"),
       sudoLocal: root.appendingPathComponent("etc/pam.d/sudo_local"),
-      moduleSource: root.appendingPathComponent("cellar/libexec/pam_companion.so"),
+      localPolicyDirectory: root.appendingPathComponent("usr/local/etc/pam.d"),
+      localPamConf: root.appendingPathComponent("usr/local/etc/pam.conf"),
       moduleDirectory: root.appendingPathComponent("usr/local/lib/pam"),
       stateDirectory: root.appendingPathComponent("var/db/pam-companion")
     )
     try fileManager.createDirectory(at: paths.policyDirectory, withIntermediateDirectories: true)
-    try fileManager.createDirectory(at: paths.moduleDirectory, withIntermediateDirectories: true)
     try fileManager.createDirectory(
-      at: paths.moduleSource.deletingLastPathComponent(),
-      withIntermediateDirectories: true
-    )
+      at: paths.localPolicyDirectory, withIntermediateDirectories: true)
+    if legacyInstallation {
+      try fileManager.createDirectory(at: paths.moduleDirectory, withIntermediateDirectories: true)
+    }
     try fileManager.createDirectory(
       at: paths.stateDirectory.deletingLastPathComponent(),
       withIntermediateDirectories: true
@@ -542,29 +743,30 @@ private final class TemporaryPAMSystem {
       "auth include sudo_local\nauth required pam_opendirectory.so\n",
       to: paths.sudoPolicy
     )
-    try write(
-      "# local policy\nauth       sufficient     pam_tid.so\nauth       sufficient     pam_watchid.so\n",
-      to: paths.sudoLocal
-    )
-    try moduleBytes.write(to: paths.moduleSource)
-    try legacyBytes.write(to: paths.legacyVersionedModule)
+    let localPolicy =
+      legacyInstallation
+      ? "# local policy\nauth       sufficient     pam_tid.so\nauth       sufficient     pam_watchid.so\n"
+      : "# local policy\n#auth       sufficient     pam_tid.so\n"
+    try write(localPolicy, to: paths.sudoLocal)
+    if legacyInstallation {
+      try legacyBytes.write(to: paths.legacyVersionedModule)
+    }
     XCTAssertEqual(chmod(paths.sudoPolicy.path, 0o444), 0)
     XCTAssertEqual(chmod(paths.sudoLocal.path, 0o444), 0)
-    XCTAssertEqual(chmod(paths.moduleSource.path, 0o444), 0)
-    XCTAssertEqual(chmod(paths.legacyVersionedModule.path, 0o444), 0)
+    if legacyInstallation {
+      XCTAssertEqual(chmod(paths.legacyVersionedModule.path, 0o444), 0)
+    }
   }
 
   func manager(
     effectiveUserID: uid_t = 0,
-    failurePoint: PAMLifecycleFailurePoint? = nil,
-    moduleValidator: ((URL) throws -> Void)? = nil
+    failurePoint: PAMLifecycleFailurePoint? = nil
   ) -> PAMLifecycleManager {
     PAMLifecycleManager(
       paths: paths,
       effectiveUserID: effectiveUserID,
       expectedOwnerUserID: getuid(),
       expectedOwnerGroupID: getgid(),
-      moduleValidator: moduleValidator ?? { _ in },
       failurePoint: failurePoint
     )
   }
@@ -575,14 +777,14 @@ private final class TemporaryPAMSystem {
     try fileSystem.createStateDirectory(paths.stateDirectory)
     let targets = [
       (paths.sudoLocal, backupName(for: paths.sudoLocal)),
-      (paths.canonicalModule, backupName(for: paths.canonicalModule)),
+      (paths.customModule, backupName(for: paths.customModule)),
       (paths.legacyModule, backupName(for: paths.legacyModule)),
       (paths.legacyVersionedModule, backupName(for: paths.legacyVersionedModule)),
     ]
     let snapshots = try targets.map {
       try fileSystem.snapshot($0.0, backupName: $0.1)
     }
-    let stagedModule = stagedURL(for: paths.canonicalModule)
+    let stagedModule = stagedURL(for: paths.customModule)
     let stagedPolicy = stagedURL(for: paths.sudoLocal)
     try fileSystem.stageModule(moduleBytes, at: stagedModule)
     try fileSystem.stagePolicy(
@@ -606,18 +808,19 @@ private final class TemporaryPAMSystem {
 
   func installPreparedCanonicalAndPolicy(_ record: PAMLifecycleRecord) throws {
     let canonical = try XCTUnwrap(
-      record.snapshots.first(where: { $0.path == paths.canonicalModule.path }))
+      record.snapshots.first(where: { $0.path == paths.customModule.path }))
     let policy = try XCTUnwrap(
       record.snapshots.first(where: { $0.path == paths.sudoLocal.path }))
     let moduleMetadata = try XCTUnwrap(record.installedModuleMetadata)
+    let moduleSHA256 = try XCTUnwrap(record.installedModuleSHA256)
     let policyMetadata = try XCTUnwrap(record.installedPolicyMetadata)
-    let stagedModule = stagedURL(for: paths.canonicalModule)
+    let stagedModule = stagedURL(for: paths.customModule)
     let stagedPolicy = stagedURL(for: paths.sudoLocal)
     try fileSystem.moveOriginalToBackup(canonical, in: paths.stateDirectory)
     try fileSystem.moveStagedFile(
       stagedModule,
-      to: paths.canonicalModule,
-      sha256: record.installedModuleSHA256,
+      to: paths.customModule,
+      sha256: moduleSHA256,
       metadata: moduleMetadata
     )
     try fileSystem.moveOriginalToBackup(policy, in: paths.stateDirectory)
@@ -629,10 +832,65 @@ private final class TemporaryPAMSystem {
     )
   }
 
-  func replaceModuleSource(with data: Data) throws {
-    try fileManager.removeItem(at: paths.moduleSource)
-    try data.write(to: paths.moduleSource)
-    XCTAssertEqual(chmod(paths.moduleSource.path, 0o444), 0)
+  func installCustomModule() throws {
+    try moduleBytes.write(to: paths.customModule)
+    XCTAssertEqual(chmod(paths.customModule.path, 0o444), 0)
+  }
+
+  func installCompleteSchemaTwoSetup() throws {
+    let fileSystem = self.fileSystem
+    try fileSystem.createStateDirectory(paths.stateDirectory)
+    let targets = [
+      (paths.sudoLocal, backupName(for: paths.sudoLocal)),
+      (paths.customModule, backupName(for: paths.customModule)),
+      (paths.legacyModule, backupName(for: paths.legacyModule)),
+      (paths.legacyVersionedModule, backupName(for: paths.legacyVersionedModule)),
+    ]
+    let snapshots = try targets.map {
+      try fileSystem.snapshot($0.0, backupName: $0.1)
+    }
+    let managedPolicy =
+      "# local policy\n#auth       sufficient     pam_tid.so\nauth       sufficient     pam_companion.so\n"
+    let stagedPolicy = stagedURL(for: paths.sudoLocal)
+    let stagedModule = stagedURL(for: paths.customModule)
+    try fileSystem.stagePolicy(
+      Data(managedPolicy.utf8),
+      at: stagedPolicy,
+      preserving: paths.sudoLocal
+    )
+    try fileSystem.stageModule(moduleBytes, at: stagedModule)
+    let policyMetadata = try fileSystem.metadata(stagedPolicy)
+    let moduleMetadata = try fileSystem.metadata(stagedModule)
+    var record = PAMLifecycleRecord(
+      schemaVersion: 2,
+      phase: .prepared,
+      snapshots: snapshots,
+      installedPolicySHA256: fileSystem.sha256(Data(managedPolicy.utf8)),
+      installedModuleSHA256: fileSystem.sha256(moduleBytes),
+      installedPolicyMetadata: policyMetadata,
+      installedModuleMetadata: moduleMetadata
+    )
+    try fileSystem.writeRecord(
+      record, to: paths.stateDirectory.appendingPathComponent("record.json"))
+
+    for snapshot in snapshots {
+      try fileSystem.moveOriginalToBackup(snapshot, in: paths.stateDirectory)
+    }
+    try fileSystem.moveStagedFile(
+      stagedModule,
+      to: paths.customModule,
+      sha256: fileSystem.sha256(moduleBytes),
+      metadata: moduleMetadata
+    )
+    try fileSystem.moveStagedFile(
+      stagedPolicy,
+      to: paths.sudoLocal,
+      sha256: fileSystem.sha256(Data(managedPolicy.utf8)),
+      metadata: policyMetadata
+    )
+    record.phase = .complete
+    try fileSystem.writeRecord(
+      record, to: paths.stateDirectory.appendingPathComponent("record.json"))
   }
 
   func backupName(for target: URL) -> String {
