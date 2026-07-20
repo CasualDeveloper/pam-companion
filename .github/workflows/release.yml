@@ -1,0 +1,141 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  package:
+    name: Build release archive
+    runs-on: macos-26
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    env:
+      REQUESTED_REF: ${{ github.ref_name }}
+      RELEASE_FROM_TAG: ${{ github.event_name == 'push' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Swift 6.3.3
+        run: |
+          set -euo pipefail
+          curl --fail --location --silent --show-error \
+            https://download.swift.org/swiftly/darwin/swiftly.pkg \
+            --output "$RUNNER_TEMP/swiftly.pkg"
+          /usr/sbin/installer \
+            -pkg "$RUNNER_TEMP/swiftly.pkg" \
+            -target CurrentUserHomeDirectory
+          "$HOME/.swiftly/bin/swiftly" init \
+            --skip-install \
+            --no-modify-profile \
+            --quiet-shell-followup \
+            --assume-yes
+          "$HOME/.swiftly/bin/swiftly" install 6.3.3 --assume-yes
+          echo "$HOME/.swiftly/bin" >> "$GITHUB_PATH"
+
+      - name: Verify toolchains and test
+        run: |
+          swiftly run swift --version | grep -F 'Swift version 6.3.3'
+          swift --version
+          swift test -Xswiftc -warnings-as-errors
+
+      - name: Package and verify
+        run: |
+          swiftly run ./Scripts/package-release.sh
+          ./Scripts/verify-release.sh dist/pam-companion-*.tar.gz
+          ./Scripts/test-release-verifier.sh dist/pam-companion-*.tar.gz
+          (cd dist && shasum -a 256 -c SHA256SUMS)
+
+      - name: Verify intrinsic version and tag
+        id: version
+        run: |
+          set -euo pipefail
+          archive="$(find dist -maxdepth 1 -name 'pam-companion-*.tar.gz' -print)"
+          test -n "$archive"
+          version="${archive##*/pam-companion-}"
+          version="${version%.tar.gz}"
+          release_tag="v${version}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$release_tag" >> "$GITHUB_OUTPUT"
+          if [[ "$RELEASE_FROM_TAG" == "true" ]]; then
+            test "$REQUESTED_REF" = "$release_tag"
+            git show-ref --verify --quiet "refs/tags/${release_tag}"
+            test "$(git rev-parse HEAD)" = "$(git rev-parse "${release_tag}^{commit}")"
+          fi
+
+      - name: Upload exact archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pam-companion-release-${{ github.sha }}
+          path: |
+            dist/pam-companion-*.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+  smoke:
+    name: Exact archive smoke (${{ matrix.name }})
+    needs: package
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS 26 Tahoe
+            runner: macos-26
+          - name: macOS 15 Sequoia
+            runner: macos-15
+          - name: macOS 14 Sonoma
+            runner: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Download exact archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: pam-companion-release-${{ github.sha }}
+          path: dist
+
+      - name: Verify and load-smoke
+        run: |
+          (cd dist && shasum -a 256 -c SHA256SUMS)
+          ./Scripts/verify-release.sh dist/pam-companion-*.tar.gz
+
+  publish:
+    name: Create draft release
+    if: github.event_name == 'push'
+    needs: [package, smoke]
+    runs-on: macos-26
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - name: Download exact archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: pam-companion-release-${{ github.sha }}
+          path: dist
+
+      - name: Attest release provenance
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: 'dist/*.tar.gz'
+
+      - name: Create draft GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.package.outputs.tag }}
+        run: |
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --verify-tag \
+            --generate-notes \
+            dist/pam-companion-*.tar.gz \
+            dist/SHA256SUMS

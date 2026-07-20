@@ -1,46 +1,96 @@
 # pam-companion
 
-A PAM module, written in Swift, for Apple Watch and Touch ID authenticating using:
-- `kLAPolicyDeviceOwnerAuthenticationWithBiometricsOrWatch` from macOS 10.15 to macOS 14; or
-- `kLAPolicyDeviceOwnerAuthenticationWithBiometricsOrCompanion` in macOS 15 or later
+`pam-companion` adds Touch ID and companion-device authentication, including Apple Watch, to macOS `sudo`. It is a standalone Swift command-line tool and PAM module.
 
-![](https://github.com/CasualDeveloper/pam-companion/blob/docs/demo.gif?raw=true)
+The project has no daemon, network service, telemetry, or credential storage. macOS performs authentication through LocalAuthentication; the module receives only the success or failure result.
 
-## Prerequisites
-
-* The most up to date version of either Xcode or the Xcode command line tools (CLT) for your version of macOS. This includes all of the tools needed to build the module, including `swiftc`, `make`, and `git`. If you do not yet have either installed, you should be prompted automatically to install teh CLT when you first try to follow the [install instructions](#installation). You can also install the CLT manually with the following command:
+## Install
 
 ```sh
-xcode-select --install
+brew install CasualDeveloper/tap/pam-companion
+pam-companion status
+sudo pam-companion setup --dry-run
+sudo pam-companion setup
 ```
 
-## Installation
+Homebrew installs files only inside its prefix. The explicit `sudo pam-companion setup` command performs the privileged work:
 
-### Quick Install (Recommended)
+- installs the canonical module at `/usr/local/lib/pam/pam_companion.so`;
+- adds `auth sufficient pam_companion.so` before the optional `pam_tid.so` line in a known-safe `/etc/pam.d/sudo_local` shape;
+- replaces supported `pam_watchid.so` or `pam_watchid.so.2` configuration;
+- removes legacy module files only when no other PAM policy still references them;
+- records an exact rollback snapshot under `/var/db/pam-companion`.
+
+Setup is idempotent. It stops before mutation unless the system `sudo` policy has the supported `sudo_local`, optional smart-card, and required `pam_opendirectory.so` authentication sequence. It also refuses ACLs, dangerous file flags, hard links, symlinks, writable root targets, unknown active `sudo_local` controls, and legacy modules still used by another PAM service. The release module is read once through a no-follow descriptor, validated from those captured bytes, and only then installed.
+
+## Check, restore, and uninstall
 
 ```sh
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/CasualDeveloper/pam-companion/HEAD/install.sh)" -- enable
+pam-companion status
+pam-companion doctor
+sudo pam-companion restore --dry-run
+sudo pam-companion restore
 ```
 
-> [!NOTE]
-> If you are using macOS Sonoma or later and have already modified `sudo_local`, ensure the file still contains the original `auth       sufficient     pam_tid.so` line, with or without the comment at the start. The enable script uses this to "anchor" where the `pam_companion.so` line will be inserted. If the line isn't present, no changes will be made.
+Restore refuses to overwrite files outside their recorded original or transactional states. If setup or restore was interrupted, `status` reports that recovery is required and `restore` resumes idempotently from the durable pre-mutation snapshots.
 
-### Nix
+Prepare Homebrew removal with one explicit restore:
 
-The module is available from nixpkgs as `pam-companion` and can be enabled using nix-darwin's [`security.pam.services.sudo_local.watchIdAuth`](https://nix-darwin.github.io/nix-darwin/manual/#opt-security.pam.services.sudo_local.watchIdAuth)
-
-### Manual
-1. Run inside a cloned copy of the repo: 
 ```sh
-make install
+sudo pam-companion uninstall --prepare
+brew uninstall pam-companion
 ```
-2. Modify the sudo pam config to include the `pam_companion.so` module. Using the following line, follow the steps according to your version of macOS.
-  ```
-  auth sufficient pam_companion.so
-  ```
-   * *On macOS 14 and later:* Create/edit `/etc/pam.d/sudo_local` to include it in the list of modules, in order of execution.
-   **If you are unsure of the order, place it on the first line.**
-   * *On macOS 13 and earlier:* Edit `/etc/pam.d/sudo` to **include it as the first line**.
 
-> [!IMPORTANT]
-> Note that you might have other `auth` statements, **don't remove them**.
+## Authentication behavior
+
+On macOS 15 and later, the module uses Apple’s current [`deviceOwnerAuthenticationWithBiometricsOrCompanion`](https://developer.apple.com/documentation/localauthentication/lapolicy/deviceownerauthenticationwithbiometricsorcompanion) policy. On macOS 14 it uses Apple’s earlier Watch spelling of the same Touch ID-or-companion policy.
+
+Authentication outcomes compose with the rest of the PAM stack:
+
+- successful LocalAuthentication returns `PAM_SUCCESS`;
+- an explicit rejected result returns `PAM_AUTH_ERR`;
+- unavailable authentication, cancellation, errors, timeout, invalid arguments, and `sudo --askpass` return `PAM_IGNORE` so the configured password path can continue.
+
+The optional module arguments are `reason=<text>` and `timeout=<1...120>`. The default timeout is 30 seconds.
+
+AuthenticationServices is not used here: Apple documents that framework for app and service sign-in, credentials, passkeys, and SSO. Direct device-owner approval remains part of [LocalAuthentication](https://developer.apple.com/documentation/localauthentication).
+
+## Requirements and build
+
+- macOS 14 or newer
+- Swift 6.3.3 for release archives
+- macOS Command Line Tools for builds and packaging
+- Xcode, or another toolchain containing XCTest, only for the test suite
+
+```sh
+swift build -c release --product pam-companion
+swift build -c release --product PAMCompanionModule
+swift test
+```
+
+The Swiftly toolchain can build both products but does not include XCTest. On this project, tests can be run with an installed Xcode explicitly:
+
+```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun swift test
+```
+
+## Release integrity
+
+The project does not currently have an Apple Developer Program membership. Release binaries are ad hoc signed with the hardened runtime and are not notarized. The Homebrew formula pins the archive SHA-256 digest, releases include checksums and GitHub build-provenance attestations, and the exact archive is verified on supported macOS versions before publication.
+
+Create and verify a local candidate without touching live PAM state:
+
+```sh
+swiftly run ./Scripts/package-release.sh --allow-dirty
+./Scripts/verify-release.sh dist/pam-companion-0.1.0.tar.gz
+```
+
+See [RELEASING.md](RELEASING.md) for the controlled live-authentication and publication gates.
+
+## Acknowledgements
+
+This project descends from the open-source `pam-watchid` and `pam-touchID` projects and their contributors. The current implementation is a greenfield Swift 6 rewrite.
+
+## License
+
+Licensed under the Apache License 2.0. See [LICENSE](LICENSE).
