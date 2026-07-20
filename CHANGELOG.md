@@ -7,7 +7,7 @@
 - Greenfield Swift 6 PAM module with system-header constants and exactly four OpenPAM exports.
 - Touch ID and companion-device authentication through Apple’s current LocalAuthentication policy.
 - Standalone `pam-companion` CLI with status, doctor, setup, restore, and uninstall preparation.
-- Explicit root boundary for privileged commands; read-only commands never invoke `sudo`.
+- Explicit root boundary for system inspection and lifecycle commands; the CLI never attempts to elevate itself.
 - Transactional `sudo_local` configuration, rollback snapshots for all tracked state, crash-resumable restore, and per-target drift protection. Apple's path-managed `com.apple.provenance` xattr is intentionally excluded.
 - Automatic migration and removal of unreferenced `pam_watchid.so` and `pam_watchid.so.2` installations.
 - Universal arm64/x86_64 ad hoc hardened-runtime release archives for macOS 14 or newer.
