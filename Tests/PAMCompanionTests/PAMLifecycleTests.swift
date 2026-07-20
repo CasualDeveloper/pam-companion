@@ -5,7 +5,64 @@ import XCTest
 @testable import PAMCompanionCore
 
 final class PAMLifecycleManagerTests: XCTestCase {
-  func testSetupMigratesLegacyInstallationAndRestoreReconstructsItExactly() throws {
+  func testTransactionalMetadataExcludesOnlyPathManagedAppleProvenance() {
+    let provenance = Data([0x01, 0x02, 0x00])
+    let custom = Data("preserve me".utf8)
+
+    XCTAssertEqual(
+      PAMFileMetadata.trackedExtendedAttributes([
+        "com.apple.provenance": provenance,
+        "dev.authcompanion.test": custom,
+      ]),
+      ["dev.authcompanion.test": custom]
+    )
+  }
+
+  func testPreparedSchemaTwoJournalContainingProvenanceCanBeRestored() throws {
+    let system = try TemporaryPAMSystem()
+    defer { system.remove() }
+    let before = try system.snapshot()
+    let prepared = try system.makePreparedRecord()
+    let provenance = Data([0x01, 0x02, 0x00, 0x94])
+    func addingProvenance(_ metadata: PAMFileMetadata?) -> PAMFileMetadata? {
+      guard let metadata else { return nil }
+      var attributes = metadata.extendedAttributes
+      attributes["com.apple.provenance"] = provenance
+      return PAMFileMetadata(
+        mode: metadata.mode,
+        ownerUserID: metadata.ownerUserID,
+        ownerGroupID: metadata.ownerGroupID,
+        flags: metadata.flags,
+        extendedAttributes: attributes
+      )
+    }
+    let legacyRecord = PAMLifecycleRecord(
+      schemaVersion: prepared.schemaVersion,
+      phase: prepared.phase,
+      snapshots: prepared.snapshots.map { snapshot in
+        PAMLifecycleSnapshot(
+          path: snapshot.path,
+          backupName: snapshot.backupName,
+          existed: snapshot.existed,
+          originalSHA256: snapshot.originalSHA256,
+          metadata: addingProvenance(snapshot.metadata)
+        )
+      },
+      installedPolicySHA256: prepared.installedPolicySHA256,
+      installedModuleSHA256: prepared.installedModuleSHA256,
+      installedPolicyMetadata: addingProvenance(prepared.installedPolicyMetadata),
+      installedModuleMetadata: addingProvenance(prepared.installedModuleMetadata)
+    )
+    try system.fileSystem.writeRecord(
+      legacyRecord,
+      to: system.paths.stateDirectory.appendingPathComponent("record.json")
+    )
+
+    XCTAssertTrue(try system.manager().restore(dryRun: false).changed)
+    XCTAssertEqual(try system.snapshot(), before)
+  }
+
+  func testSetupMigratesLegacyInstallationAndRestoresTrackedStateAndOriginalInodes() throws {
     let system = try TemporaryPAMSystem()
     defer { system.remove() }
     let originalPolicy = try system.read(system.paths.sudoLocal)
@@ -150,7 +207,7 @@ final class PAMLifecycleManagerTests: XCTestCase {
     XCTAssertEqual(try system.snapshot(), before)
   }
 
-  func testEveryInjectedSetupFailureRollsBackExactly() throws {
+  func testEveryInjectedSetupFailureRollsBackTrackedState() throws {
     for point in PAMLifecycleFailurePoint.setupCases {
       let system = try TemporaryPAMSystem()
       defer { system.remove() }

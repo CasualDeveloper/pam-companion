@@ -30,16 +30,16 @@ Manual workflow runs only create a seven-day candidate artifact. They do not cre
 
 PAM mutations and authentication prompts are intentionally excluded from hosted CI. Test the exact draft archive or a formula pointing to it on a Mac with a known administrator password and an already-open recovery shell.
 
-1. Record the current bytes, mode, owner, flags, and extended attributes of `/etc/pam.d/sudo_local` and any files under `/usr/local/lib/pam` named `pam_companion.so`, `pam_watchid.so`, or `pam_watchid.so.2`.
+1. Record the current bytes, mode, owner, flags, and extended attributes of `/etc/pam.d/sudo_local` and any files under `/usr/local/lib/pam` named `pam_companion.so`, `pam_watchid.so`, or `pam_watchid.so.2`. Compare every xattr except `com.apple.provenance`, which macOS rewrites as a path-managed value during renames.
 2. Install the candidate through a temporary Homebrew formula whose URL and SHA-256 digest match the draft archive.
 3. Run `pam-companion status`, then `sudo pam-companion setup --dry-run`.
 4. Run `sudo pam-companion setup`; verify that legacy entries/files were migrated and `pam-companion doctor` passes.
 5. In a new terminal, run `sudo -k; sudo true` and complete Touch ID or Apple Watch authentication.
 6. Run `sudo -k; sudo true`, cancel companion authentication, and verify the administrator password fallback still succeeds.
-7. Run `sudo pam-companion restore`; prove the captured pre-test state was reconstructed exactly.
+7. Run `sudo pam-companion restore`; prove the captured tracked state was reconstructed, with only the documented `com.apple.provenance` exception.
 8. Run setup again, verify idempotence and authentication once more, and leave the desired canonical installation active.
 
-Keep the recovery shell open until password fallback and exact restore have both passed. Stop on any unexpected PAM shape, missing fallback, lifecycle drift, or rollback error.
+Keep the recovery shell open until password fallback and tracked-state restore have both passed. Stop on any unexpected PAM shape, missing fallback, lifecycle drift, or rollback error.
 
 ## Publish and update Homebrew
 

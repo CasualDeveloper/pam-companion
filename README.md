@@ -19,9 +19,11 @@ Homebrew installs files only inside its prefix. The explicit `sudo pam-companion
 - adds `auth sufficient pam_companion.so` before the optional `pam_tid.so` line in a known-safe `/etc/pam.d/sudo_local` shape;
 - replaces supported `pam_watchid.so` or `pam_watchid.so.2` configuration;
 - removes legacy module files only when no other PAM policy still references them;
-- journals the transaction under `/var/db/pam-companion` and preserves exact rollback files as hidden siblings of their PAM targets, avoiding cross-directory metadata changes.
+- journals the transaction under `/var/db/pam-companion` and preserves rollback files as hidden sibling inodes beside their PAM targets.
 
 Setup is idempotent. It stops before mutation unless the system `sudo` policy has the supported `sudo_local`, optional smart-card, and required `pam_opendirectory.so` authentication sequence. It also refuses ACLs, dangerous file flags, hard links, symlinks, writable root targets, unknown active `sudo_local` controls, and legacy modules still used by another PAM service. The release module is read once through a no-follow descriptor, validated from those captured bytes, and only then installed.
+
+Rollback validation covers bytes, ownership, permissions, flags, and every recorded extended attribute. The sole exception is Apple's opaque `com.apple.provenance` attribute: macOS rewrites that path-managed value during otherwise metadata-preserving renames, so it is neither recorded nor compared.
 
 ## Check, restore, and uninstall
 

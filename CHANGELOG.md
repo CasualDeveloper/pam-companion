@@ -8,7 +8,7 @@
 - Touch ID and companion-device authentication through Apple’s current LocalAuthentication policy.
 - Standalone `pam-companion` CLI with status, doctor, setup, restore, and uninstall preparation.
 - Explicit root boundary for privileged commands; read-only commands never invoke `sudo`.
-- Transactional `sudo_local` configuration, exact rollback snapshots, crash-resumable restore, and per-target drift protection.
+- Transactional `sudo_local` configuration, rollback snapshots for all tracked state, crash-resumable restore, and per-target drift protection. Apple's path-managed `com.apple.provenance` xattr is intentionally excluded.
 - Automatic migration and removal of unreferenced `pam_watchid.so` and `pam_watchid.so.2` installations.
 - Universal arm64/x86_64 ad hoc hardened-runtime release archives for macOS 14 or newer.
 - Deterministic tests for authentication, PAM ABI boundaries, configuration parsing, CLI behavior, rollback failures, recovery, metadata preservation, and unsafe targets.

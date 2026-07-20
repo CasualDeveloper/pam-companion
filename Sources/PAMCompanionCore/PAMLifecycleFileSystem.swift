@@ -424,7 +424,7 @@ struct PAMLifecycleFileSystem {
     guard record.schemaVersion == 2 else {
       throw PAMLifecycleError.invalidState("unsupported schema version")
     }
-    return record
+    return record.normalizingTrackedExtendedAttributes()
   }
 
   func sha256(_ data: Data) -> String {
@@ -444,7 +444,7 @@ struct PAMLifecycleFileSystem {
       ownerUserID: UInt32(info.st_uid),
       ownerGroupID: UInt32(info.st_gid),
       flags: UInt32(info.st_flags),
-      extendedAttributes: try extendedAttributes(url)
+      extendedAttributes: PAMFileMetadata.trackedExtendedAttributes(try extendedAttributes(url))
     )
   }
 
