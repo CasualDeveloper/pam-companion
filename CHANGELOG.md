@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.1 - 2026-07-21
+
+### Changed
+
+- Replace the custom `pam_companion.so` authentication module with transactional management of Apple’s built-in `pam_tid.so` integration.
+- Migrate complete 0.1.0 lifecycle journals to the native policy while preserving the original pre-setup rollback point.
+- Remove the custom module, its LocalAuthentication implementation, C ABI bridge, and module artifact from the release archive.
+- Detect external references across all four macOS PAM policy search locations before removing `pam_companion.so`, `pam_watchid.so`, or `pam_watchid.so.2` files.
+- Report 0.1.0 lifecycle state as migration-needed and revalidate the required password fallback during status, doctor, and idempotent setup.
+- Recover safely from interruption before the initial lifecycle journal becomes durable.
+
+### Security
+
+- Bind approval to the user requested by PAM by delegating the privileged flow to Apple’s native implementation.
+- Eliminate a custom device-owner authentication path that did not read `PAM_USER` and was unavailable when loaded by `sudo` on the tested system.
+
 ## 0.1.0 - 2026-07-20
 
 ### Added

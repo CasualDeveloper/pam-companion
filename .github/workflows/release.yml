@@ -100,7 +100,7 @@ jobs:
           name: pam-companion-release-${{ github.sha }}
           path: dist
 
-      - name: Verify and load-smoke
+      - name: Verify archive
         run: |
           (cd dist && shasum -a 256 -c SHA256SUMS)
           ./Scripts/verify-release.sh dist/pam-companion-*.tar.gz

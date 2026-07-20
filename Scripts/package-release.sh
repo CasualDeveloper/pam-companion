@@ -47,15 +47,6 @@ for architecture in arm64 x86_64; do
         --arch "$architecture" \
         --product pam-companion \
         -Xswiftc -warnings-as-errors
-    $swift_executable build \
-        --package-path "$repository_root" \
-        --scratch-path "$scratch" \
-        -c release \
-        --arch "$architecture" \
-        --product PAMCompanionModule \
-        -Xswiftc -warnings-as-errors \
-        -Xlinker -exported_symbols_list \
-        -Xlinker "$repository_root/Support/pam_companion.exports"
     bin_path=$($swift_executable build \
         --package-path "$repository_root" \
         --scratch-path "$scratch" \
@@ -63,7 +54,6 @@ for architecture in arm64 x86_64; do
         --arch "$architecture" \
         --show-bin-path)
     cp "$bin_path/pam-companion" "$scratch_root/pam-companion-$architecture"
-    cp "$bin_path/libPAMCompanionModule.dylib" "$scratch_root/pam_companion-$architecture.so"
 done
 
 post_commit=$(git -C "$repository_root" rev-parse HEAD)
@@ -77,17 +67,9 @@ lipo -create \
     "$scratch_root/pam-companion-arm64" \
     "$scratch_root/pam-companion-x86_64" \
     -output "$scratch_root/pam-companion"
-lipo -create \
-    "$scratch_root/pam_companion-arm64.so" \
-    "$scratch_root/pam_companion-x86_64.so" \
-    -output "$scratch_root/pam_companion.so"
-install_name_tool -id pam_companion.so "$scratch_root/pam_companion.so"
 chmod 0555 "$scratch_root/pam-companion"
-chmod 0444 "$scratch_root/pam_companion.so"
 codesign --force --sign - --options runtime --timestamp=none "$scratch_root/pam-companion"
-codesign --force --sign - --options runtime --timestamp=none "$scratch_root/pam_companion.so"
 codesign --verify --strict "$scratch_root/pam-companion"
-codesign --verify --strict "$scratch_root/pam_companion.so"
 
 version_output=$($scratch_root/pam-companion --version)
 version=${version_output#pam-companion }
@@ -99,16 +81,14 @@ version=${version_output#pam-companion }
 
 package_name="pam-companion-$version"
 package_root="$scratch_root/package/$package_name"
-mkdir -p "$package_root/bin" "$package_root/libexec"
+mkdir -p "$package_root/bin"
 cp "$scratch_root/pam-companion" "$package_root/bin/"
-cp "$scratch_root/pam_companion.so" "$package_root/libexec/"
 chmod 0555 "$package_root/bin/pam-companion"
-chmod 0444 "$package_root/libexec/pam_companion.so"
 cp "$repository_root/LICENSE" "$repository_root/README.md" \
     "$repository_root/SECURITY.md" "$package_root/"
 (
     cd "$package_root"
-    shasum -a 256 bin/pam-companion libexec/pam_companion.so > SHA256SUMS
+    shasum -a 256 bin/pam-companion > SHA256SUMS
 )
 
 mkdir -p "$repository_root/dist"

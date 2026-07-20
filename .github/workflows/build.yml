@@ -35,10 +35,8 @@ jobs:
           uname -m
           swift --version
 
-      - name: Build CLI and PAM module
-        run: |
-          swift build -c release --product pam-companion -Xswiftc -warnings-as-errors
-          swift build -c release --product PAMCompanionModule -Xswiftc -warnings-as-errors
+      - name: Build CLI
+        run: swift build -c release --product pam-companion -Xswiftc -warnings-as-errors
 
       - name: Test
         run: swift test -Xswiftc -warnings-as-errors
@@ -112,7 +110,7 @@ jobs:
           name: pam-companion-${{ github.sha }}
           path: dist
 
-      - name: Verify and load-smoke
+      - name: Verify archive
         run: |
           (cd dist && shasum -a 256 -c SHA256SUMS)
           ./Scripts/verify-release.sh dist/pam-companion-*.tar.gz

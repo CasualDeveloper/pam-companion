@@ -66,8 +66,6 @@ $package_name/SECURITY.md
 $package_name/SHA256SUMS
 $package_name/bin/
 $package_name/bin/pam-companion
-$package_name/libexec/
-$package_name/libexec/pam_companion.so
 EOF
 LC_ALL=C sort "$scratch_root/entries" > "$scratch_root/entries.sorted"
 LC_ALL=C sort "$scratch_root/expected" > "$scratch_root/expected.sorted"
@@ -82,13 +80,8 @@ find "$package" -type l -exec false {} +
 )
 
 cli="$package/bin/pam-companion"
-module="$package/libexec/pam_companion.so"
 [ "$(stat -f '%Lp' "$cli")" = "555" ] || {
     echo "CLI mode must be 0555" >&2
-    exit 1
-}
-[ "$(stat -f '%Lp' "$module")" = "444" ] || {
-    echo "PAM module mode must be 0444" >&2
     exit 1
 }
 [ "$($cli --version)" = "pam-companion $version" ]
@@ -110,30 +103,5 @@ verify_binary() {
 }
 
 verify_binary "$cli"
-verify_binary "$module"
-
-for architecture in arm64 x86_64; do
-    install_name=$(otool -arch "$architecture" -D "$module" | sed -n '2p')
-    [ "$install_name" = "pam_companion.so" ]
-    nm -arch "$architecture" -gjU "$module" | LC_ALL=C sort > "$scratch_root/exports"
-    LC_ALL=C sort "$repository_root/Support/pam_companion.exports" > "$scratch_root/expected.exports"
-    diff -u "$scratch_root/expected.exports" "$scratch_root/exports"
-    otool -arch "$architecture" -L "$module" | sed -n '3,$p' | \
-        awk '{ print $1 }' | while IFS= read -r dependency; do
-            case "$dependency" in
-                /usr/lib/*|/System/Library/*) ;;
-                *) echo "unexpected linked dependency: $dependency" >&2; exit 1 ;;
-            esac
-        done
-done
-
-xcrun clang \
-    -std=c17 \
-    -Wall \
-    -Wextra \
-    -Werror \
-    "$repository_root/Tests/ArtifactSmoke/pam_companion_smoke.c" \
-    -o "$scratch_root/pam_companion_smoke"
-"$scratch_root/pam_companion_smoke" "$module"
 
 echo "PASS: verified pam-companion $version release archive"

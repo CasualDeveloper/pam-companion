@@ -19,7 +19,6 @@ trap cleanup EXIT
 
 tar -xzf "$archive" -C "$scratch_root"
 chmod 0755 "$scratch_root/$package_name/bin/pam-companion"
-chmod 0644 "$scratch_root/$package_name/libexec/pam_companion.so"
 COPYFILE_DISABLE=1 tar \
     --uid 0 \
     --gid 0 \
@@ -34,5 +33,5 @@ if "$script_directory/verify-release.sh" "$scratch_root/$archive_name" \
     echo "release verifier accepted an archive with writable executable modes" >&2
     exit 1
 fi
-grep -Eq 'CLI mode must be 0555|PAM module mode must be 0444' "$scratch_root/output"
+grep -Fq 'CLI mode must be 0555' "$scratch_root/output"
 echo "PASS: release verifier rejects tampered executable modes"
