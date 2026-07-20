@@ -10,6 +10,7 @@ final class PAMLifecycleManagerTests: XCTestCase {
     defer { system.remove() }
     let originalPolicy = try system.read(system.paths.sudoLocal)
     let originalMode = try system.mode(system.paths.sudoLocal)
+    let originalIdentity = try system.fileIdentity(system.paths.sudoLocal)
     let attribute = Data("preserve me".utf8)
     try system.setExtendedAttribute(
       attribute, name: "dev.authcompanion.test", on: system.paths.sudoLocal)
@@ -26,6 +27,11 @@ final class PAMLifecycleManagerTests: XCTestCase {
     XCTAssertFalse(system.exists(system.paths.legacyVersionedModule))
     XCTAssertEqual(try system.mode(system.paths.sudoLocal), originalMode)
     XCTAssertEqual(
+      try system.fileIdentity(
+        system.paths.stateDirectory.appendingPathComponent("sudo_local.original")),
+      originalIdentity
+    )
+    XCTAssertEqual(
       try system.extendedAttribute(name: "dev.authcompanion.test", on: system.paths.sudoLocal),
       attribute
     )
@@ -35,6 +41,7 @@ final class PAMLifecycleManagerTests: XCTestCase {
 
     XCTAssertTrue(restore.changed)
     XCTAssertEqual(try system.read(system.paths.sudoLocal), originalPolicy)
+    XCTAssertEqual(try system.fileIdentity(system.paths.sudoLocal), originalIdentity)
     XCTAssertEqual(try system.read(system.paths.legacyVersionedModule), system.legacyBytes)
     XCTAssertEqual(
       try system.extendedAttribute(name: "dev.authcompanion.test", on: system.paths.sudoLocal),
@@ -183,11 +190,20 @@ final class PAMLifecycleManagerTests: XCTestCase {
     let system = try TemporaryPAMSystem()
     defer { system.remove() }
     let before = try system.snapshot()
-    let fileSystem = PAMLifecycleFileSystem(
-      expectedOwnerUserID: getuid(),
-      expectedOwnerGroupID: getgid()
-    )
-    let plan = try PAMConfigurationPlanner.plan(try system.read(system.paths.sudoLocal))
+    let record = try system.makePreparedRecord()
+    try system.installPreparedCanonicalAndPolicy(record)
+
+    let manager = system.manager()
+    XCTAssertEqual(try manager.status(), .recoveryRequired)
+    XCTAssertTrue(try manager.restore(dryRun: false).changed)
+    XCTAssertEqual(try system.snapshot(), before)
+  }
+
+  func testPreparingStateCanBeRestoredBeforeAnyPAMMutation() throws {
+    let system = try TemporaryPAMSystem()
+    defer { system.remove() }
+    let before = try system.snapshot()
+    let fileSystem = system.fileSystem
     try fileSystem.createStateDirectory(system.paths.stateDirectory)
     let targets = [
       (system.paths.sudoLocal, "sudo_local.original"),
@@ -196,25 +212,26 @@ final class PAMLifecycleManagerTests: XCTestCase {
       (system.paths.legacyVersionedModule, "pam_watchid.so.2.original"),
     ]
     let snapshots = try targets.map {
-      try fileSystem.snapshot(
-        $0.0,
-        backupName: $0.1,
-        stateDirectory: system.paths.stateDirectory
-      )
+      try fileSystem.snapshot($0.0, backupName: $0.1)
     }
+    let plan = try PAMConfigurationPlanner.plan(try system.read(system.paths.sudoLocal))
     let record = PAMLifecycleRecord(
-      schemaVersion: 1,
-      phase: .prepared,
+      schemaVersion: 2,
+      phase: .preparing,
       snapshots: snapshots,
       installedPolicySHA256: fileSystem.sha256(Data(plan.updated.utf8)),
-      installedModuleSHA256: fileSystem.sha256(system.moduleBytes)
+      installedModuleSHA256: fileSystem.sha256(system.moduleBytes),
+      installedPolicyMetadata: nil,
+      installedModuleMetadata: nil
     )
     try fileSystem.writeRecord(
       record,
       to: system.paths.stateDirectory.appendingPathComponent("record.json")
     )
-    try fileSystem.installModule(system.moduleBytes, to: system.paths.canonicalModule)
-    try fileSystem.replacePolicy(system.paths.sudoLocal, with: Data(plan.updated.utf8))
+    try fileSystem.installModule(
+      system.moduleBytes,
+      to: system.paths.stateDirectory.appendingPathComponent("pam_companion.so.pending")
+    )
 
     let manager = system.manager()
     XCTAssertEqual(try manager.status(), .recoveryRequired)
@@ -245,6 +262,53 @@ final class PAMLifecycleManagerTests: XCTestCase {
 
     XCTAssertThrowsError(try system.manager().restore(dryRun: false)) { error in
       XCTAssertEqual(error as? PAMLifecycleError, .managedStateDrift(system.paths.sudoLocal.path))
+    }
+  }
+
+  func testPreparedRecoveryRefusesInterveningExtendedAttributeChanges() throws {
+    let system = try TemporaryPAMSystem()
+    defer { system.remove() }
+    try system.makePreparedRecord()
+    try system.setExtendedAttribute(
+      Data("administrator changed metadata".utf8),
+      name: "dev.authcompanion.drift",
+      on: system.paths.sudoLocal
+    )
+
+    XCTAssertThrowsError(try system.manager().restore(dryRun: false)) { error in
+      XCTAssertEqual(error as? PAMLifecycleError, .managedStateDrift(system.paths.sudoLocal.path))
+    }
+  }
+
+  func testInterruptedRecoveryRefusesTransactionalExtendedAttributeChanges() throws {
+    let system = try TemporaryPAMSystem()
+    defer { system.remove() }
+    let record = try system.makePreparedRecord()
+    try system.installPreparedCanonicalAndPolicy(record)
+    try system.setExtendedAttribute(
+      Data("administrator changed managed metadata".utf8),
+      name: "dev.authcompanion.managed-drift",
+      on: system.paths.sudoLocal
+    )
+
+    XCTAssertThrowsError(try system.manager().restore(dryRun: false)) { error in
+      XCTAssertEqual(error as? PAMLifecycleError, .managedStateDrift(system.paths.sudoLocal.path))
+    }
+  }
+
+  func testCompletedSetupRejectsADeletedOriginalBackup() throws {
+    let system = try TemporaryPAMSystem()
+    defer { system.remove() }
+    let manager = system.manager()
+    _ = try manager.setup(dryRun: false)
+    try FileManager.default.removeItem(
+      at: system.paths.stateDirectory.appendingPathComponent("sudo_local.original"))
+
+    XCTAssertThrowsError(try manager.status()) { error in
+      XCTAssertEqual(
+        error as? PAMLifecycleError,
+        .invalidState("missing backup: sudo_local.original")
+      )
     }
   }
 
@@ -300,6 +364,20 @@ final class PAMLifecycleManagerTests: XCTestCase {
       XCTAssertThrowsError(try system.manager().setup(dryRun: false)) { error in
         XCTAssertEqual(
           error as? PAMLifecycleError, .unsafePath(system.paths.legacyVersionedModule.path))
+      }
+    }
+  }
+
+  func testWritablePrivilegedAncestorIsRejected() throws {
+    let system = try TemporaryPAMSystem()
+    defer { system.remove() }
+    XCTAssertEqual(chmod(system.root.path, 0o777), 0)
+
+    XCTAssertThrowsError(try system.manager().setup(dryRun: false)) { error in
+      guard let lifecycleError = error as? PAMLifecycleError,
+        case .unsafePath = lifecycleError
+      else {
+        return XCTFail("expected unsafePath, received \(error)")
       }
     }
   }
@@ -397,7 +475,8 @@ private final class TemporaryPAMSystem {
     )
   }
 
-  func makePreparedRecord() throws {
+  @discardableResult
+  func makePreparedRecord() throws -> PAMLifecycleRecord {
     let plan = try PAMConfigurationPlanner.plan(try read(paths.sudoLocal))
     try fileSystem.createStateDirectory(paths.stateDirectory)
     let targets = [
@@ -407,17 +486,53 @@ private final class TemporaryPAMSystem {
       (paths.legacyVersionedModule, "pam_watchid.so.2.original"),
     ]
     let snapshots = try targets.map {
-      try fileSystem.snapshot($0.0, backupName: $0.1, stateDirectory: paths.stateDirectory)
+      try fileSystem.snapshot($0.0, backupName: $0.1)
     }
+    let stagedModule = paths.stateDirectory.appendingPathComponent("pam_companion.so.pending")
+    let stagedPolicy = paths.stateDirectory.appendingPathComponent("sudo_local.pending")
+    try fileSystem.installModule(moduleBytes, to: stagedModule)
+    try fileSystem.replacePolicy(
+      stagedPolicy,
+      with: Data(plan.updated.utf8),
+      template: paths.sudoLocal
+    )
     let record = PAMLifecycleRecord(
-      schemaVersion: 1,
+      schemaVersion: 2,
       phase: .prepared,
       snapshots: snapshots,
       installedPolicySHA256: fileSystem.sha256(Data(plan.updated.utf8)),
-      installedModuleSHA256: fileSystem.sha256(moduleBytes)
+      installedModuleSHA256: fileSystem.sha256(moduleBytes),
+      installedPolicyMetadata: try fileSystem.metadata(stagedPolicy),
+      installedModuleMetadata: try fileSystem.metadata(stagedModule)
     )
     try fileSystem.writeRecord(
       record, to: paths.stateDirectory.appendingPathComponent("record.json"))
+    return record
+  }
+
+  func installPreparedCanonicalAndPolicy(_ record: PAMLifecycleRecord) throws {
+    let canonical = try XCTUnwrap(
+      record.snapshots.first(where: { $0.path == paths.canonicalModule.path }))
+    let policy = try XCTUnwrap(
+      record.snapshots.first(where: { $0.path == paths.sudoLocal.path }))
+    let moduleMetadata = try XCTUnwrap(record.installedModuleMetadata)
+    let policyMetadata = try XCTUnwrap(record.installedPolicyMetadata)
+    let stagedModule = paths.stateDirectory.appendingPathComponent("pam_companion.so.pending")
+    let stagedPolicy = paths.stateDirectory.appendingPathComponent("sudo_local.pending")
+    try fileSystem.moveOriginalToBackup(canonical, in: paths.stateDirectory)
+    try fileSystem.moveStagedFile(
+      stagedModule,
+      to: paths.canonicalModule,
+      sha256: record.installedModuleSHA256,
+      metadata: moduleMetadata
+    )
+    try fileSystem.moveOriginalToBackup(policy, in: paths.stateDirectory)
+    try fileSystem.moveStagedFile(
+      stagedPolicy,
+      to: paths.sudoLocal,
+      sha256: record.installedPolicySHA256,
+      metadata: policyMetadata
+    )
   }
 
   func replaceModuleSource(with data: Data) throws {
@@ -447,6 +562,14 @@ private final class TemporaryPAMSystem {
       throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
     }
     return info.st_mode & 0o777
+  }
+
+  func fileIdentity(_ url: URL) throws -> String {
+    var info = stat()
+    guard lstat(url.path, &info) == 0 else {
+      throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+    }
+    return "\(info.st_dev):\(info.st_ino)"
   }
 
   func setExtendedAttribute(_ data: Data, name: String, on url: URL) throws {

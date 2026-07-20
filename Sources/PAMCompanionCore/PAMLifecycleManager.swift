@@ -107,6 +107,12 @@ public final class PAMLifecycleManager: PAMLifecycleManaging {
   }
 
   private var recordURL: URL { paths.stateDirectory.appendingPathComponent("record.json") }
+  private var stagedModuleURL: URL {
+    paths.stateDirectory.appendingPathComponent("pam_companion.so.pending")
+  }
+  private var stagedPolicyURL: URL {
+    paths.stateDirectory.appendingPathComponent("sudo_local.pending")
+  }
 
   private struct SetupPreparation {
     let policyPlan: PAMConfigurationPlan
@@ -161,34 +167,79 @@ public final class PAMLifecycleManager: PAMLifecycleManaging {
     var record: PAMLifecycleRecord?
     do {
       try fileSystem.createStateDirectory(paths.stateDirectory)
-      let targets = [
-        (paths.sudoLocal, "sudo_local.original"),
-        (paths.canonicalModule, "pam_companion.so.original"),
-        (paths.legacyModule, "pam_watchid.so.original"),
-        (paths.legacyVersionedModule, "pam_watchid.so.2.original"),
+      let policySnapshot = try fileSystem.snapshot(
+        paths.sudoLocal,
+        backupName: "sudo_local.original"
+      )
+      let canonicalSnapshot = try fileSystem.snapshot(
+        paths.canonicalModule,
+        backupName: "pam_companion.so.original"
+      )
+      let legacySnapshot = try fileSystem.snapshot(
+        paths.legacyModule,
+        backupName: "pam_watchid.so.original"
+      )
+      let versionedLegacySnapshot = try fileSystem.snapshot(
+        paths.legacyVersionedModule,
+        backupName: "pam_watchid.so.2.original"
+      )
+      let snapshots = [
+        policySnapshot,
+        canonicalSnapshot,
+        legacySnapshot,
+        versionedLegacySnapshot,
       ]
-      let snapshots = try targets.map {
-        try fileSystem.snapshot($0.0, backupName: $0.1, stateDirectory: paths.stateDirectory)
-      }
       var preparedRecord = PAMLifecycleRecord(
-        schemaVersion: 1,
-        phase: .prepared,
+        schemaVersion: 2,
+        phase: .preparing,
         snapshots: snapshots,
         installedPolicySHA256: fileSystem.sha256(Data(preparation.policyPlan.updated.utf8)),
-        installedModuleSHA256: fileSystem.sha256(preparation.moduleData)
+        installedModuleSHA256: fileSystem.sha256(preparation.moduleData),
+        installedPolicyMetadata: nil,
+        installedModuleMetadata: nil
       )
-      record = preparedRecord
       try fileSystem.writeRecord(preparedRecord, to: recordURL)
+      record = preparedRecord
+
+      try fileSystem.installModule(preparation.moduleData, to: stagedModuleURL)
+      try fileSystem.replacePolicy(
+        stagedPolicyURL,
+        with: Data(preparation.policyPlan.updated.utf8),
+        template: paths.sudoLocal
+      )
+      let stagedModuleMetadata = try fileSystem.metadata(stagedModuleURL)
+      let stagedPolicyMetadata = try fileSystem.metadata(stagedPolicyURL)
+      preparedRecord.installedModuleMetadata = stagedModuleMetadata
+      preparedRecord.installedPolicyMetadata = stagedPolicyMetadata
+      preparedRecord.phase = .prepared
+      try fileSystem.writeRecord(preparedRecord, to: recordURL)
+      record = preparedRecord
       try failIfRequested(.afterStatePrepared)
 
-      try fileSystem.installModule(preparation.moduleData, to: paths.canonicalModule)
+      try fileSystem.moveOriginalToBackup(canonicalSnapshot, in: paths.stateDirectory)
+      try failIfRequested(.afterCanonicalBackedUp)
+      try fileSystem.moveStagedFile(
+        stagedModuleURL,
+        to: paths.canonicalModule,
+        sha256: preparedRecord.installedModuleSHA256,
+        metadata: stagedModuleMetadata
+      )
       try failIfRequested(.afterModuleInstalled)
 
-      try fileSystem.replacePolicy(paths.sudoLocal, with: Data(preparation.policyPlan.updated.utf8))
+      try fileSystem.moveOriginalToBackup(policySnapshot, in: paths.stateDirectory)
+      try failIfRequested(.afterPolicyBackedUp)
+      try fileSystem.moveStagedFile(
+        stagedPolicyURL,
+        to: paths.sudoLocal,
+        sha256: preparedRecord.installedPolicySHA256,
+        metadata: stagedPolicyMetadata
+      )
       try failIfRequested(.afterPolicyInstalled)
 
-      try fileSystem.removeIfPresent(paths.legacyModule)
-      try fileSystem.removeIfPresent(paths.legacyVersionedModule)
+      try fileSystem.moveOriginalToBackup(legacySnapshot, in: paths.stateDirectory)
+      try failIfRequested(.afterLegacyBackedUp)
+      try fileSystem.moveOriginalToBackup(versionedLegacySnapshot, in: paths.stateDirectory)
+      try failIfRequested(.afterVersionedLegacyBackedUp)
       try failIfRequested(.afterLegacyRemoved)
 
       preparedRecord.phase = .complete
@@ -260,11 +311,39 @@ public final class PAMLifecycleManager: PAMLifecycleManaging {
     }
     for snapshot in record.snapshots {
       let backup = paths.stateDirectory.appendingPathComponent(snapshot.backupName)
-      if snapshot.existed {
-        try fileSystem.validateRegularRootTarget(backup)
-      } else if fileSystem.exists(backup) {
-        throw PAMLifecycleError.invalidState("unexpected backup: \(snapshot.backupName)")
+      let hasOriginalSHA256 = snapshot.originalSHA256 != nil
+      let hasMetadata = snapshot.metadata != nil
+      guard snapshot.existed == hasOriginalSHA256,
+        snapshot.existed == hasMetadata,
+        snapshot.originalSHA256.map(isSHA256) ?? true
+      else {
+        throw PAMLifecycleError.invalidState("invalid snapshot: \(snapshot.path)")
       }
+      if fileSystem.exists(backup) {
+        guard snapshot.existed, record.phase != .preparing else {
+          throw PAMLifecycleError.invalidState("unexpected backup: \(snapshot.backupName)")
+        }
+        try fileSystem.validateOriginal(snapshot, at: backup)
+      } else if record.phase == .complete, snapshot.existed {
+        throw PAMLifecycleError.invalidState("missing backup: \(snapshot.backupName)")
+      }
+    }
+    let hasPolicyMetadata = record.installedPolicyMetadata != nil
+    let hasModuleMetadata = record.installedModuleMetadata != nil
+    guard hasPolicyMetadata == hasModuleMetadata else {
+      throw PAMLifecycleError.invalidState("transactional metadata is incomplete")
+    }
+    switch record.phase {
+    case .preparing:
+      guard !hasPolicyMetadata else {
+        throw PAMLifecycleError.invalidState("preparing state contains transactional metadata")
+      }
+    case .prepared, .complete:
+      guard hasPolicyMetadata else {
+        throw PAMLifecycleError.invalidState("transactional metadata is missing")
+      }
+    case .restoring:
+      break
     }
     return record
   }
@@ -277,11 +356,23 @@ public final class PAMLifecycleManager: PAMLifecycleManaging {
   }
 
   private func managedStateMatches(_ record: PAMLifecycleRecord) throws -> Bool {
-    guard fileSystem.exists(paths.sudoLocal), fileSystem.exists(paths.canonicalModule) else {
+    guard fileSystem.exists(paths.sudoLocal),
+      fileSystem.exists(paths.canonicalModule),
+      let policyMetadata = record.installedPolicyMetadata,
+      let moduleMetadata = record.installedModuleMetadata
+    else {
       return false
     }
-    return try fileSystem.sha256(paths.sudoLocal) == record.installedPolicySHA256
-      && fileSystem.sha256(paths.canonicalModule) == record.installedModuleSHA256
+    return try fileSystem.managedFileMatches(
+      at: paths.sudoLocal,
+      sha256: record.installedPolicySHA256,
+      metadata: policyMetadata
+    )
+      && fileSystem.managedFileMatches(
+        at: paths.canonicalModule,
+        sha256: record.installedModuleSHA256,
+        metadata: moduleMetadata
+      )
       && !fileSystem.exists(paths.legacyModule)
       && !fileSystem.exists(paths.legacyVersionedModule)
   }
@@ -297,24 +388,42 @@ public final class PAMLifecycleManager: PAMLifecycleManaging {
     record: PAMLifecycleRecord
   ) throws {
     let target = URL(fileURLWithPath: snapshot.path)
-    let currentHash: String?
-    if fileSystem.exists(target) {
-      try fileSystem.validateRegularRootTarget(target)
-      currentHash = try fileSystem.sha256(target)
-    } else {
-      currentHash = nil
-    }
-
-    let originalHash: String?
+    let backup = backupURL(snapshot.backupName)
     if snapshot.existed {
-      originalHash = try fileSystem.sha256(
-        paths.stateDirectory.appendingPathComponent(snapshot.backupName)
-      )
-    } else {
-      originalHash = nil
+      if fileSystem.exists(backup) {
+        try fileSystem.validateOriginal(snapshot, at: backup)
+        guard fileSystem.exists(target) else { return }
+        if let expectedSHA256 = transactionalHash(for: snapshot.path, record: record),
+          let expectedMetadata = transactionalMetadata(for: snapshot.path, record: record),
+          try fileSystem.managedFileMatches(
+            at: target,
+            sha256: expectedSHA256,
+            metadata: expectedMetadata
+          )
+        {
+          return
+        }
+        try fileSystem.validateOriginal(snapshot, at: target)
+        return
+      }
+      guard fileSystem.exists(target) else {
+        throw PAMLifecycleError.managedStateDrift(snapshot.path)
+      }
+      try fileSystem.validateOriginal(snapshot, at: target)
+      return
     }
-    let transactionalHash = transactionalHash(for: snapshot.path, record: record)
-    guard currentHash == originalHash || currentHash == transactionalHash else {
+    guard !fileSystem.exists(backup) else {
+      throw PAMLifecycleError.invalidState("unexpected backup: \(snapshot.backupName)")
+    }
+    guard fileSystem.exists(target) else { return }
+    guard let expectedSHA256 = transactionalHash(for: snapshot.path, record: record),
+      let expectedMetadata = transactionalMetadata(for: snapshot.path, record: record),
+      try fileSystem.managedFileMatches(
+        at: target,
+        sha256: expectedSHA256,
+        metadata: expectedMetadata
+      )
+    else {
       throw PAMLifecycleError.managedStateDrift(snapshot.path)
     }
   }
@@ -326,6 +435,21 @@ public final class PAMLifecycleManager: PAMLifecycleManaging {
     case paths.legacyModule.path, paths.legacyVersionedModule.path: nil
     default: nil
     }
+  }
+
+  private func transactionalMetadata(
+    for path: String,
+    record: PAMLifecycleRecord
+  ) -> PAMFileMetadata? {
+    switch path {
+    case paths.sudoLocal.path: record.installedPolicyMetadata
+    case paths.canonicalModule.path: record.installedModuleMetadata
+    default: nil
+    }
+  }
+
+  private func backupURL(_ name: String) -> URL {
+    paths.stateDirectory.appendingPathComponent(name)
   }
 
   private func verifyPasswordFallback(_ data: Data) throws {
