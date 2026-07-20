@@ -2,59 +2,130 @@ name: Build
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [main]
   pull_request:
-    branches: [ "main" ]
-  schedule:
-    - cron: '0 0 1 */2 *'
-
-env:
-  outPath: "/usr/local/lib/pam/pam_companion.so"
+  workflow_dispatch:
 
 jobs:
-  build:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
     strategy:
-      matrix:
-        version: [14, 15, 15-intel, 26]
-        xcode-select: ["xcode", "clt"]
       fail-fast: false
-
-    name: Build (macos-${{ matrix.version }}${{ matrix.xcode-select == 'clt' && ', Command Line Tools' || '' }})
-
-    runs-on: macos-${{ matrix.version }}
-
-    permissions:
-      id-token: write
-      contents: read
-      attestations: write
-
+      matrix:
+        include:
+          - name: macOS 26 Tahoe
+            runner: macos-26
+          - name: macOS 15 Sequoia
+            runner: macos-15
+          - name: macOS 14 Sonoma
+            runner: macos-14
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
-      
-    - name: Switch to Xcode Command Line Tools
-      if: ${{ matrix.xcode-select == 'clt' }}
-      run: sudo xcode-select --switch /Library/Developer/CommandLineTools
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-    - name: Build
-      run: make enable
+      - name: Install Swift 6.3.3
+        run: |
+          set -euo pipefail
+          curl --fail --location --silent --show-error \
+            https://download.swift.org/swiftly/darwin/swiftly.pkg \
+            --output "$RUNNER_TEMP/swiftly.pkg"
+          /usr/sbin/installer \
+            -pkg "$RUNNER_TEMP/swiftly.pkg" \
+            -target CurrentUserHomeDirectory
+          "$HOME/.swiftly/bin/swiftly" init \
+            --skip-install \
+            --no-modify-profile \
+            --quiet-shell-followup \
+            --assume-yes
+          "$HOME/.swiftly/bin/swiftly" install 6.3.3 --assume-yes
+          echo "$HOME/.swiftly/bin" >> "$GITHUB_PATH"
 
-    - name: Get Version
-      id: getVersion
-      if: ${{ matrix.xcode-select == 'xcode' && matrix.version == 15 }}
-      run: echo "version=$(cat version)" >> "$GITHUB_OUTPUT"
+      - name: Runner versions
+        run: |
+          sw_vers
+          uname -m
+          swift --version
+          swiftly run swift --version | grep -F 'Swift version 6.3.3'
 
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v4
-      if: ${{ matrix.xcode-select == 'xcode' && matrix.version == 15 }}
-      with:
-        name: pam-companion.so.${{ steps.getVersion.outputs.version }}
-        path: ${{ env.outPath }}.${{ steps.getVersion.outputs.version }}
-        if-no-files-found: error
-        retention-days: ${{ github.event_name == 'pull_request' && 7 || 90 }}
+      - name: Build CLI and PAM module
+        run: |
+          swiftly run swift build -c release --product pam-companion -Xswiftc -warnings-as-errors
+          swiftly run swift build -c release --product PAMCompanionModule -Xswiftc -warnings-as-errors
 
-    - name: Generate artifact attestation
-      uses: actions/attest-build-provenance@v2
-      if: ${{ matrix.xcode-select == 'xcode' && matrix.version == 15 && github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
-      with:
-        subject-path: ${{ env.outPath }}.${{ steps.getVersion.outputs.version }}
+      - name: Test
+        run: swift test -Xswiftc -warnings-as-errors
+
+  package:
+    name: Package release archive
+    needs: test
+    runs-on: macos-26
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Swift 6.3.3
+        run: |
+          set -euo pipefail
+          curl --fail --location --silent --show-error \
+            https://download.swift.org/swiftly/darwin/swiftly.pkg \
+            --output "$RUNNER_TEMP/swiftly.pkg"
+          /usr/sbin/installer \
+            -pkg "$RUNNER_TEMP/swiftly.pkg" \
+            -target CurrentUserHomeDirectory
+          "$HOME/.swiftly/bin/swiftly" init \
+            --skip-install \
+            --no-modify-profile \
+            --quiet-shell-followup \
+            --assume-yes
+          "$HOME/.swiftly/bin/swiftly" install 6.3.3 --assume-yes
+          echo "$HOME/.swiftly/bin" >> "$GITHUB_PATH"
+
+      - name: Assert release toolchain
+        run: swiftly run swift --version | grep -F 'Swift version 6.3.3'
+
+      - name: Package and verify
+        run: |
+          swiftly run ./Scripts/package-release.sh
+          ./Scripts/verify-release.sh dist/pam-companion-*.tar.gz
+          ./Scripts/test-release-verifier.sh dist/pam-companion-*.tar.gz
+          (cd dist && shasum -a 256 -c SHA256SUMS)
+
+      - name: Upload exact archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pam-companion-${{ github.sha }}
+          path: |
+            dist/pam-companion-*.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+  smoke:
+    name: Exact archive smoke (${{ matrix.name }})
+    needs: package
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS 26 Tahoe
+            runner: macos-26
+          - name: macOS 15 Sequoia
+            runner: macos-15
+          - name: macOS 14 Sonoma
+            runner: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Download exact archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: pam-companion-${{ github.sha }}
+          path: dist
+
+      - name: Verify and load-smoke
+        run: |
+          (cd dist && shasum -a 256 -c SHA256SUMS)
+          ./Scripts/verify-release.sh dist/pam-companion-*.tar.gz
