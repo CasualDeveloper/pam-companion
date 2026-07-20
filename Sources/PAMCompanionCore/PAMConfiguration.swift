@@ -5,6 +5,7 @@ public enum PAMConfigurationError: Error, Equatable, CustomStringConvertible {
   case duplicateModuleEntries
   case unsupportedModuleEntry
   case invalidModuleArguments
+  case unsupportedLocalPolicy
 
   public var description: String {
     switch self {
@@ -16,6 +17,9 @@ public enum PAMConfigurationError: Error, Equatable, CustomStringConvertible {
       return "companion module entries must use 'auth sufficient'"
     case .invalidModuleArguments:
       return "companion module entry contains unsupported arguments"
+    case .unsupportedLocalPolicy:
+      return
+        "sudo_local contains an active entry outside the supported companion and Touch ID policy"
     }
   }
 }
@@ -46,10 +50,21 @@ public enum PAMConfigurationPlanner {
     }
 
     var lines = configuration.components(separatedBy: "\n")
+    var touchIDIndices: [Int] = []
     let matches = try lines.enumerated().compactMap { index, line -> ModuleEntry? in
-      guard let tokens = policyTokens(line), tokens.count >= 3 else { return nil }
+      guard let tokens = policyTokens(line) else { return nil }
+      guard tokens.count >= 3 else { throw PAMConfigurationError.unsupportedLocalPolicy }
       let module = moduleName(tokens[2])
-      guard module == canonicalModule || legacyModules.contains(module) else { return nil }
+      if module == "pam_tid.so" {
+        guard tokens == ["auth", "sufficient", "pam_tid.so"] else {
+          throw PAMConfigurationError.unsupportedLocalPolicy
+        }
+        touchIDIndices.append(index)
+        return nil
+      }
+      guard module == canonicalModule || legacyModules.contains(module) else {
+        throw PAMConfigurationError.unsupportedLocalPolicy
+      }
       guard tokens[0] == "auth", tokens[1] == "sufficient" else {
         throw PAMConfigurationError.unsupportedModuleEntry
       }
@@ -62,6 +77,9 @@ public enum PAMConfigurationPlanner {
 
     guard matches.count <= 1 else {
       throw PAMConfigurationError.duplicateModuleEntries
+    }
+    guard touchIDIndices.count <= 1 else {
+      throw PAMConfigurationError.unsupportedLocalPolicy
     }
     if matches.first?.module == canonicalModule {
       return PAMConfigurationPlan(
@@ -79,10 +97,11 @@ public enum PAMConfigurationPlanner {
       lines.remove(at: legacy.index)
     }
 
-    let insertionIndex = lines.firstIndex(where: { line in
-      guard let tokens = policyTokens(line) else { return false }
-      return tokens.first == "auth"
-    }) ?? (lines.last == "" ? lines.count - 1 : lines.count)
+    let insertionIndex =
+      lines.firstIndex(where: { line in
+        guard let tokens = policyTokens(line), tokens.count == 3 else { return false }
+        return tokens == ["auth", "sufficient", "pam_tid.so"]
+      }) ?? (lines.last == "" ? lines.count - 1 : lines.count)
     let suffix = arguments.isEmpty ? "" : " " + arguments.joined(separator: " ")
     lines.insert(canonicalLine + suffix, at: insertionIndex)
 

@@ -62,36 +62,45 @@ public final class PAMLifecycleManager: PAMLifecycleManaging {
 
   public func setup(dryRun: Bool) throws -> PAMLifecycleResult {
     try requireRoot()
-    let preparation = try prepareSetup()
-    if preparation.alreadyConfigured {
-      return PAMLifecycleResult(changed: false, summary: "pam-companion is already configured")
-    }
     if dryRun {
-      return PAMLifecycleResult(changed: true, summary: "would install pam_companion.so and update sudo_local")
-    }
-    return try fileSystem.withLock(paths.lock) {
-      let lockedPreparation = try prepareSetup()
-      guard !lockedPreparation.alreadyConfigured else {
+      let preparation = try prepareSetup()
+      if preparation.alreadyConfigured {
         return PAMLifecycleResult(changed: false, summary: "pam-companion is already configured")
       }
-      return try performSetup(lockedPreparation)
+      return PAMLifecycleResult(
+        changed: true, summary: "would install pam_companion.so and update sudo_local")
+    }
+    return try fileSystem.withLock(paths.lock) {
+      let preparation = try prepareSetup()
+      guard !preparation.alreadyConfigured else {
+        return PAMLifecycleResult(changed: false, summary: "pam-companion is already configured")
+      }
+      return try performSetup(preparation)
     }
   }
 
   public func restore(dryRun: Bool) throws -> PAMLifecycleResult {
     try requireRoot()
     guard fileSystem.exists(paths.stateDirectory) else {
-      return PAMLifecycleResult(changed: false, summary: "pam-companion has no managed setup to restore")
+      return PAMLifecycleResult(
+        changed: false, summary: "pam-companion has no managed setup to restore")
     }
     let record = try loadRecord()
-    if record.phase == .complete { try verifyManagedState(record) }
+    try verifyRecoverableState(record)
     if dryRun {
-      return PAMLifecycleResult(changed: true, summary: "would restore the pre-setup PAM configuration")
+      return PAMLifecycleResult(
+        changed: true, summary: "would restore the pre-setup PAM configuration")
     }
     return try fileSystem.withLock(paths.lock) {
-      let lockedRecord = try loadRecord()
-      if lockedRecord.phase == .complete { try verifyManagedState(lockedRecord) }
-      try restoreSnapshots(lockedRecord)
+      var lockedRecord = try loadRecord()
+      try verifyRecoverableState(lockedRecord)
+      if lockedRecord.phase != .restoring {
+        lockedRecord.phase = .restoring
+        try fileSystem.writeRecord(lockedRecord, to: recordURL)
+      }
+      try failIfRequested(.afterRestoreStarted)
+      try restoreSnapshots(lockedRecord, injectingFailures: true)
+      try failIfRequested(.beforeStateCleanup)
       try fileSystem.removeTree(paths.stateDirectory)
       return PAMLifecycleResult(changed: true, summary: "restored the pre-setup PAM configuration")
     }
@@ -101,6 +110,7 @@ public final class PAMLifecycleManager: PAMLifecycleManaging {
 
   private struct SetupPreparation {
     let policyPlan: PAMConfigurationPlan
+    let moduleData: Data
     let alreadyConfigured: Bool
   }
 
@@ -110,8 +120,8 @@ public final class PAMLifecycleManager: PAMLifecycleManaging {
     try fileSystem.validateDirectory(paths.stateDirectory.deletingLastPathComponent())
     try fileSystem.validateRegularRootTarget(paths.sudoPolicy)
     try fileSystem.validateRegularRootTarget(paths.sudoLocal)
-    try fileSystem.validateSourceModule(paths.moduleSource)
-    try moduleValidator(paths.moduleSource)
+    let moduleData = try fileSystem.readSourceModule(paths.moduleSource)
+    try fileSystem.withTemporaryModule(moduleData) { try moduleValidator($0) }
 
     if fileSystem.exists(paths.stateDirectory) {
       let record = try loadRecord()
@@ -121,21 +131,20 @@ public final class PAMLifecycleManager: PAMLifecycleManaging {
       }
       return SetupPreparation(
         policyPlan: try PAMConfigurationPlanner.plan(fileSystem.read(paths.sudoLocal)),
+        moduleData: moduleData,
         alreadyConfigured: true
       )
     }
 
     try verifyPasswordFallback(fileSystem.read(paths.sudoPolicy))
     for module in [paths.canonicalModule, paths.legacyModule, paths.legacyVersionedModule]
-      where fileSystem.exists(module)
-    {
+    where fileSystem.exists(module) {
       try fileSystem.validateRegularRootTarget(module)
     }
     let plan = try PAMConfigurationPlanner.plan(fileSystem.read(paths.sudoLocal))
     var policies = try fileSystem.policyFiles(in: paths.policyDirectory)
     for path in policies.keys
-      where URL(fileURLWithPath: path).lastPathComponent == paths.sudoLocal.lastPathComponent
-    {
+    where URL(fileURLWithPath: path).lastPathComponent == paths.sudoLocal.lastPathComponent {
       policies.removeValue(forKey: path)
     }
     policies[paths.sudoLocal.path] = Data(plan.updated.utf8)
@@ -145,7 +154,7 @@ public final class PAMLifecycleManager: PAMLifecycleManaging {
         policy: URL(fileURLWithPath: reference.policyPath).lastPathComponent
       )
     }
-    return SetupPreparation(policyPlan: plan, alreadyConfigured: false)
+    return SetupPreparation(policyPlan: plan, moduleData: moduleData, alreadyConfigured: false)
   }
 
   private func performSetup(_ preparation: SetupPreparation) throws -> PAMLifecycleResult {
@@ -166,13 +175,13 @@ public final class PAMLifecycleManager: PAMLifecycleManaging {
         phase: .prepared,
         snapshots: snapshots,
         installedPolicySHA256: fileSystem.sha256(Data(preparation.policyPlan.updated.utf8)),
-        installedModuleSHA256: try fileSystem.sha256(paths.moduleSource)
+        installedModuleSHA256: fileSystem.sha256(preparation.moduleData)
       )
       record = preparedRecord
       try fileSystem.writeRecord(preparedRecord, to: recordURL)
       try failIfRequested(.afterStatePrepared)
 
-      try fileSystem.installModule(from: paths.moduleSource, to: paths.canonicalModule)
+      try fileSystem.installModule(preparation.moduleData, to: paths.canonicalModule)
       try failIfRequested(.afterModuleInstalled)
 
       try fileSystem.replacePolicy(paths.sudoLocal, with: Data(preparation.policyPlan.updated.utf8))
@@ -184,14 +193,15 @@ public final class PAMLifecycleManager: PAMLifecycleManaging {
 
       preparedRecord.phase = .complete
       try fileSystem.writeRecord(preparedRecord, to: recordURL)
-      return PAMLifecycleResult(changed: true, summary: "installed pam_companion.so and updated sudo_local")
+      return PAMLifecycleResult(
+        changed: true, summary: "installed pam_companion.so and updated sudo_local")
     } catch {
       guard let record else {
         try? fileSystem.removeTree(paths.stateDirectory)
         throw error
       }
       do {
-        try restoreSnapshots(record)
+        try restoreSnapshots(record, injectingFailures: false)
         try fileSystem.removeTree(paths.stateDirectory)
       } catch {
         throw PAMLifecycleError.rollbackFailed(String(describing: error))
@@ -200,13 +210,32 @@ public final class PAMLifecycleManager: PAMLifecycleManaging {
     }
   }
 
-  private func restoreSnapshots(_ record: PAMLifecycleRecord) throws {
+  private func restoreSnapshots(
+    _ record: PAMLifecycleRecord,
+    injectingFailures: Bool
+  ) throws {
+    try verifyRecoverableState(record)
     let policyPath = paths.sudoLocal.path
     for snapshot in record.snapshots where snapshot.path != policyPath {
+      try verifyRecoverableSnapshot(snapshot, record: record)
       try fileSystem.restore(snapshot, from: paths.stateDirectory)
+      if injectingFailures {
+        try failIfRequested(restoreFailurePoint(for: snapshot.path))
+      }
     }
     if let policy = record.snapshots.first(where: { $0.path == policyPath }) {
+      try verifyRecoverableSnapshot(policy, record: record)
       try fileSystem.restore(policy, from: paths.stateDirectory)
+      if injectingFailures { try failIfRequested(.afterPolicyRestored) }
+    }
+  }
+
+  private func restoreFailurePoint(for path: String) -> PAMLifecycleFailurePoint {
+    switch path {
+    case paths.canonicalModule.path: .afterCanonicalRestored
+    case paths.legacyModule.path: .afterLegacyRestored
+    case paths.legacyVersionedModule.path: .afterVersionedLegacyRestored
+    default: .afterPolicyRestored
     }
   }
 
@@ -241,9 +270,10 @@ public final class PAMLifecycleManager: PAMLifecycleManaging {
   }
 
   private func isSHA256(_ value: String) -> Bool {
-    value.count == 64 && value.utf8.allSatisfy { byte in
-      (48...57).contains(byte) || (97...102).contains(byte)
-    }
+    value.count == 64
+      && value.utf8.allSatisfy { byte in
+        (48...57).contains(byte) || (97...102).contains(byte)
+      }
   }
 
   private func managedStateMatches(_ record: PAMLifecycleRecord) throws -> Bool {
@@ -256,19 +286,45 @@ public final class PAMLifecycleManager: PAMLifecycleManaging {
       && !fileSystem.exists(paths.legacyVersionedModule)
   }
 
-  private func verifyManagedState(_ record: PAMLifecycleRecord) throws {
-    guard fileSystem.exists(paths.sudoLocal),
-      try fileSystem.sha256(paths.sudoLocal) == record.installedPolicySHA256
-    else {
-      throw PAMLifecycleError.managedStateDrift(paths.sudoLocal.path)
+  private func verifyRecoverableState(_ record: PAMLifecycleRecord) throws {
+    for snapshot in record.snapshots {
+      try verifyRecoverableSnapshot(snapshot, record: record)
     }
-    guard fileSystem.exists(paths.canonicalModule),
-      try fileSystem.sha256(paths.canonicalModule) == record.installedModuleSHA256
-    else {
-      throw PAMLifecycleError.managedStateDrift(paths.canonicalModule.path)
+  }
+
+  private func verifyRecoverableSnapshot(
+    _ snapshot: PAMLifecycleSnapshot,
+    record: PAMLifecycleRecord
+  ) throws {
+    let target = URL(fileURLWithPath: snapshot.path)
+    let currentHash: String?
+    if fileSystem.exists(target) {
+      try fileSystem.validateRegularRootTarget(target)
+      currentHash = try fileSystem.sha256(target)
+    } else {
+      currentHash = nil
     }
-    for legacy in [paths.legacyModule, paths.legacyVersionedModule] where fileSystem.exists(legacy) {
-      throw PAMLifecycleError.managedStateDrift(legacy.path)
+
+    let originalHash: String?
+    if snapshot.existed {
+      originalHash = try fileSystem.sha256(
+        paths.stateDirectory.appendingPathComponent(snapshot.backupName)
+      )
+    } else {
+      originalHash = nil
+    }
+    let transactionalHash = transactionalHash(for: snapshot.path, record: record)
+    guard currentHash == originalHash || currentHash == transactionalHash else {
+      throw PAMLifecycleError.managedStateDrift(snapshot.path)
+    }
+  }
+
+  private func transactionalHash(for path: String, record: PAMLifecycleRecord) -> String? {
+    switch path {
+    case paths.sudoLocal.path: record.installedPolicySHA256
+    case paths.canonicalModule.path: record.installedModuleSHA256
+    case paths.legacyModule.path, paths.legacyVersionedModule.path: nil
+    default: nil
     }
   }
 
@@ -276,16 +332,24 @@ public final class PAMLifecycleManager: PAMLifecycleManaging {
     guard let policy = String(data: data, encoding: .utf8), !data.contains(0) else {
       throw PAMLifecycleError.passwordFallbackUnavailable
     }
-    let lines = policy.components(separatedBy: "\n").map(activeTokens)
-    guard let includeIndex = lines.firstIndex(where: { tokens in
-      tokens.count >= 3 && tokens[0] == "auth" && tokens[1] == "include" && tokens[2] == "sudo_local"
-    }) else {
+    let authenticationLines = policy.components(separatedBy: "\n")
+      .map(activeTokens)
+      .filter { $0.first == "auth" }
+    let allowedWithoutSmartcard = [
+      ["auth", "include", "sudo_local"],
+      ["auth", "required", "pam_opendirectory.so"],
+    ]
+    let allowedWithSmartcard = [
+      ["auth", "include", "sudo_local"],
+      ["auth", "sufficient", "pam_smartcard.so"],
+      ["auth", "required", "pam_opendirectory.so"],
+    ]
+    guard
+      authenticationLines == allowedWithoutSmartcard
+        || authenticationLines == allowedWithSmartcard
+    else {
       throw PAMLifecycleError.passwordFallbackUnavailable
     }
-    let hasFallback = lines.dropFirst(includeIndex + 1).contains { tokens in
-      tokens.count >= 3 && tokens[0] == "auth" && ["required", "requisite"].contains(tokens[1])
-    }
-    guard hasFallback else { throw PAMLifecycleError.passwordFallbackUnavailable }
   }
 
   private func activeTokens(_ line: String) -> [String] {
@@ -316,13 +380,32 @@ enum SystemPAMModuleValidator {
     guard codesign.status == 0 else {
       throw PAMLifecycleError.moduleValidation(codesign.error)
     }
+    let signature = try run("/usr/bin/codesign", ["-d", "--verbose=4", url.path])
+    guard signature.status == 0 else {
+      throw PAMLifecycleError.moduleValidation(signature.error)
+    }
+    try validateSignatureDetails(signature.output + signature.error)
     let architectures = try run("/usr/bin/lipo", ["-archs", url.path])
     guard architectures.status == 0 else {
       throw PAMLifecycleError.moduleValidation(architectures.error)
     }
-    let values = Set(architectures.output.split(whereSeparator: { $0.isWhitespace }).map(String.init))
+    let values = Set(
+      architectures.output.split(whereSeparator: { $0.isWhitespace }).map(String.init))
     guard values == ["arm64", "x86_64"] else {
       throw PAMLifecycleError.moduleValidation("expected universal arm64 and x86_64 architectures")
+    }
+  }
+
+  static func validateSignatureDetails(_ details: String) throws {
+    let lines = details.components(separatedBy: "\n")
+    guard lines.contains("Signature=adhoc"),
+      lines.contains(where: { line in
+        line.hasPrefix("CodeDirectory ") && line.contains("(adhoc,runtime)")
+      })
+    else {
+      throw PAMLifecycleError.moduleValidation(
+        "expected an ad hoc signature with the hardened runtime"
+      )
     }
   }
 

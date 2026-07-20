@@ -11,7 +11,8 @@ final class PAMLifecycleManagerTests: XCTestCase {
     let originalPolicy = try system.read(system.paths.sudoLocal)
     let originalMode = try system.mode(system.paths.sudoLocal)
     let attribute = Data("preserve me".utf8)
-    try system.setExtendedAttribute(attribute, name: "dev.authcompanion.test", on: system.paths.sudoLocal)
+    try system.setExtendedAttribute(
+      attribute, name: "dev.authcompanion.test", on: system.paths.sudoLocal)
     let manager = system.manager()
 
     let setup = try manager.setup(dryRun: false)
@@ -55,6 +56,20 @@ final class PAMLifecycleManagerTests: XCTestCase {
     XCTAssertEqual(try system.snapshot(), before)
   }
 
+  func testSetupInstallsTheExactModuleBytesValidatedFromOneDescriptor() throws {
+    let system = try TemporaryPAMSystem()
+    defer { system.remove() }
+    let replacement = Data("path was replaced after validation began".utf8)
+    let manager = system.manager(moduleValidator: { _ in
+      try system.replaceModuleSource(with: replacement)
+    })
+
+    _ = try manager.setup(dryRun: false)
+
+    XCTAssertEqual(try system.read(system.paths.canonicalModule), system.moduleBytes)
+    XCTAssertEqual(try system.read(system.paths.moduleSource), replacement)
+  }
+
   func testSetupRequiresExplicitRootExecution() throws {
     let system = try TemporaryPAMSystem()
     defer { system.remove() }
@@ -67,15 +82,47 @@ final class PAMLifecycleManagerTests: XCTestCase {
   }
 
   func testSetupRefusesWhenSudoPasswordFallbackCannotBeProven() throws {
+    let unsupportedPolicies = [
+      "auth include sudo_local\n",
+      "auth include sudo_local\nauth required pam_deny.so\n",
+      "auth include sudo_local\nauth required pam_permit.so\n",
+      "auth include sudo_local\nauth sufficient pam_smartcard.so\n",
+      "auth include nested\nauth required pam_opendirectory.so\n",
+      "auth required pam_opendirectory.so\nauth include sudo_local\n",
+      "auth include sudo_local\nauth requisite pam_opendirectory.so\n",
+      "auth include sudo_local\nauth required pam_opendirectory.so\nauth required pam_deny.so\n",
+    ]
+    for policy in unsupportedPolicies {
+      let system = try TemporaryPAMSystem()
+      defer { system.remove() }
+      try system.write(policy, to: system.paths.sudoPolicy)
+      let before = try system.snapshot()
+
+      XCTAssertThrowsError(try system.manager().setup(dryRun: false), policy) { error in
+        XCTAssertEqual(error as? PAMLifecycleError, .passwordFallbackUnavailable)
+      }
+      XCTAssertEqual(try system.snapshot(), before)
+    }
+  }
+
+  func testSetupAcceptsCurrentMacOSSudoPasswordFallbackShape() throws {
     let system = try TemporaryPAMSystem()
     defer { system.remove() }
-    try system.write("auth include sudo_local\n", to: system.paths.sudoPolicy)
-    let before = try system.snapshot()
+    try system.write(
+      """
+      # sudo: auth account password session
+      auth       include        sudo_local
+      auth       sufficient     pam_smartcard.so
+      auth       required       pam_opendirectory.so
+      account    required       pam_permit.so
+      password   required       pam_deny.so
+      session    required       pam_permit.so
 
-    XCTAssertThrowsError(try system.manager().setup(dryRun: false)) { error in
-      XCTAssertEqual(error as? PAMLifecycleError, .passwordFallbackUnavailable)
-    }
-    XCTAssertEqual(try system.snapshot(), before)
+      """,
+      to: system.paths.sudoPolicy
+    )
+
+    XCTAssertTrue(try system.manager().setup(dryRun: true).changed)
   }
 
   func testSetupRefusesToRemoveLegacyModuleReferencedByAnotherPolicy() throws {
@@ -97,7 +144,7 @@ final class PAMLifecycleManagerTests: XCTestCase {
   }
 
   func testEveryInjectedSetupFailureRollsBackExactly() throws {
-    for point in PAMLifecycleFailurePoint.allCases {
+    for point in PAMLifecycleFailurePoint.setupCases {
       let system = try TemporaryPAMSystem()
       defer { system.remove() }
       let before = try system.snapshot()
@@ -166,13 +213,39 @@ final class PAMLifecycleManagerTests: XCTestCase {
       record,
       to: system.paths.stateDirectory.appendingPathComponent("record.json")
     )
-    try fileSystem.installModule(from: system.paths.moduleSource, to: system.paths.canonicalModule)
+    try fileSystem.installModule(system.moduleBytes, to: system.paths.canonicalModule)
     try fileSystem.replacePolicy(system.paths.sudoLocal, with: Data(plan.updated.utf8))
 
     let manager = system.manager()
     XCTAssertEqual(try manager.status(), .recoveryRequired)
     XCTAssertTrue(try manager.restore(dryRun: false).changed)
     XCTAssertEqual(try system.snapshot(), before)
+  }
+
+  func testRestoreResumesAfterEveryDurableRestoreFailurePoint() throws {
+    for point in PAMLifecycleFailurePoint.restoreCases {
+      let system = try TemporaryPAMSystem()
+      defer { system.remove() }
+      let before = try system.snapshot()
+      _ = try system.manager().setup(dryRun: false)
+
+      XCTAssertThrowsError(
+        try system.manager(failurePoint: point).restore(dryRun: false), "\(point)")
+      XCTAssertEqual(try system.manager().status(), .recoveryRequired, "\(point)")
+      XCTAssertTrue(try system.manager().restore(dryRun: false).changed, "\(point)")
+      XCTAssertEqual(try system.snapshot(), before, "restore mismatch after \(point)")
+    }
+  }
+
+  func testPreparedRecoveryRefusesInterveningAdministratorChanges() throws {
+    let system = try TemporaryPAMSystem()
+    defer { system.remove() }
+    try system.makePreparedRecord()
+    try system.write("# administrator repair\n", to: system.paths.sudoLocal)
+
+    XCTAssertThrowsError(try system.manager().restore(dryRun: false)) { error in
+      XCTAssertEqual(error as? PAMLifecycleError, .managedStateDrift(system.paths.sudoLocal.path))
+    }
   }
 
   func testSymlinkedModuleAndStateTargetsAreRejected() throws {
@@ -183,7 +256,8 @@ final class PAMLifecycleManagerTests: XCTestCase {
     try system.replaceWithSymbolicLink(system.paths.legacyVersionedModule, destination: sentinel)
 
     XCTAssertThrowsError(try system.manager().setup(dryRun: false)) { error in
-      XCTAssertEqual(error as? PAMLifecycleError, .unsafePath(system.paths.legacyVersionedModule.path))
+      XCTAssertEqual(
+        error as? PAMLifecycleError, .unsafePath(system.paths.legacyVersionedModule.path))
     }
     XCTAssertEqual(try system.read(sentinel), Data("do not touch".utf8))
 
@@ -195,6 +269,70 @@ final class PAMLifecycleManagerTests: XCTestCase {
       XCTAssertEqual(error as? PAMLifecycleError, .unsafePath(system.paths.stateDirectory.path))
     }
   }
+
+  func testACLsImmutableFlagsAndHardLinksAreRejected() throws {
+    do {
+      let system = try TemporaryPAMSystem()
+      defer { system.remove() }
+      try system.addWriteACL(to: system.paths.sudoLocal)
+      XCTAssertThrowsError(try system.manager().setup(dryRun: false)) { error in
+        XCTAssertEqual(error as? PAMLifecycleError, .unsafePath(system.paths.sudoLocal.path))
+      }
+    }
+
+    do {
+      let system = try TemporaryPAMSystem()
+      defer {
+        try? system.clearFlags(on: system.paths.sudoLocal)
+        system.remove()
+      }
+      try system.makeImmutable(system.paths.sudoLocal)
+      XCTAssertThrowsError(try system.manager().setup(dryRun: false)) { error in
+        XCTAssertEqual(error as? PAMLifecycleError, .unsafePath(system.paths.sudoLocal.path))
+      }
+    }
+
+    do {
+      let system = try TemporaryPAMSystem()
+      defer { system.remove() }
+      let alias = system.root.appendingPathComponent("legacy-hard-link")
+      try FileManager.default.linkItem(at: system.paths.legacyVersionedModule, to: alias)
+      XCTAssertThrowsError(try system.manager().setup(dryRun: false)) { error in
+        XCTAssertEqual(
+          error as? PAMLifecycleError, .unsafePath(system.paths.legacyVersionedModule.path))
+      }
+    }
+  }
+
+  func testFailedLockContenderCannotUnlinkTheActiveLock() throws {
+    let system = try TemporaryPAMSystem()
+    defer { system.remove() }
+    let fileSystem = system.fileSystem
+
+    try fileSystem.withLock(system.paths.lock) {
+      XCTAssertThrowsError(try fileSystem.withLock(system.paths.lock) {})
+      XCTAssertTrue(system.exists(system.paths.lock))
+      XCTAssertThrowsError(try fileSystem.withLock(system.paths.lock) {})
+    }
+    XCTAssertTrue(system.exists(system.paths.lock))
+  }
+}
+
+final class SystemPAMModuleValidatorTests: XCTestCase {
+  func testRequiresAdHocHardenedRuntimeSignatureDetails() throws {
+    XCTAssertNoThrow(
+      try SystemPAMModuleValidator.validateSignatureDetails(
+        "Signature=adhoc\nCodeDirectory v=20500 flags=0x10002(adhoc,runtime)\n"
+      )
+    )
+    let rejected = [
+      "Signature=adhoc\nCodeDirectory v=20500 flags=0x2(adhoc)\n",
+      "Authority=Developer ID Application: Example\nCodeDirectory flags=0x10000(runtime)\n",
+    ]
+    for details in rejected {
+      XCTAssertThrowsError(try SystemPAMModuleValidator.validateSignatureDetails(details))
+    }
+  }
 }
 
 private final class TemporaryPAMSystem {
@@ -203,6 +341,10 @@ private final class TemporaryPAMSystem {
   let moduleBytes = Data("new universal module".utf8)
   let legacyBytes = Data("old legacy module".utf8)
   private let fileManager = FileManager.default
+
+  var fileSystem: PAMLifecycleFileSystem {
+    PAMLifecycleFileSystem(expectedOwnerUserID: getuid(), expectedOwnerGroupID: getgid())
+  }
 
   init() throws {
     root = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -242,16 +384,46 @@ private final class TemporaryPAMSystem {
 
   func manager(
     effectiveUserID: uid_t = 0,
-    failurePoint: PAMLifecycleFailurePoint? = nil
+    failurePoint: PAMLifecycleFailurePoint? = nil,
+    moduleValidator: ((URL) throws -> Void)? = nil
   ) -> PAMLifecycleManager {
     PAMLifecycleManager(
       paths: paths,
       effectiveUserID: effectiveUserID,
       expectedOwnerUserID: getuid(),
       expectedOwnerGroupID: getgid(),
-      moduleValidator: { _ in },
+      moduleValidator: moduleValidator ?? { _ in },
       failurePoint: failurePoint
     )
+  }
+
+  func makePreparedRecord() throws {
+    let plan = try PAMConfigurationPlanner.plan(try read(paths.sudoLocal))
+    try fileSystem.createStateDirectory(paths.stateDirectory)
+    let targets = [
+      (paths.sudoLocal, "sudo_local.original"),
+      (paths.canonicalModule, "pam_companion.so.original"),
+      (paths.legacyModule, "pam_watchid.so.original"),
+      (paths.legacyVersionedModule, "pam_watchid.so.2.original"),
+    ]
+    let snapshots = try targets.map {
+      try fileSystem.snapshot($0.0, backupName: $0.1, stateDirectory: paths.stateDirectory)
+    }
+    let record = PAMLifecycleRecord(
+      schemaVersion: 1,
+      phase: .prepared,
+      snapshots: snapshots,
+      installedPolicySHA256: fileSystem.sha256(Data(plan.updated.utf8)),
+      installedModuleSHA256: fileSystem.sha256(moduleBytes)
+    )
+    try fileSystem.writeRecord(
+      record, to: paths.stateDirectory.appendingPathComponent("record.json"))
+  }
+
+  func replaceModuleSource(with data: Data) throws {
+    try fileManager.removeItem(at: paths.moduleSource)
+    try data.write(to: paths.moduleSource)
+    XCTAssertEqual(chmod(paths.moduleSource.path, 0o444), 0)
   }
 
   func exists(_ url: URL) -> Bool { fileManager.fileExists(atPath: url.path) }
@@ -312,9 +484,11 @@ private final class TemporaryPAMSystem {
 
   func snapshot() throws -> [String: Data] {
     guard exists(root) else { return [:] }
-    let enumerator = try XCTUnwrap(fileManager.enumerator(at: root, includingPropertiesForKeys: nil))
+    let enumerator = try XCTUnwrap(
+      fileManager.enumerator(at: root, includingPropertiesForKeys: nil))
     var result: [String: Data] = [:]
-    for case let url as URL in enumerator where !url.hasDirectoryPath {
+    for case let url as URL in enumerator
+    where !url.hasDirectoryPath && url.lastPathComponent != "pam-companion.lock" {
       result[String(url.path.dropFirst(root.path.count))] = try Data(contentsOf: url)
     }
     return result
@@ -325,5 +499,27 @@ private final class TemporaryPAMSystem {
   func replaceWithSymbolicLink(_ url: URL, destination: URL) throws {
     if exists(url) { try fileManager.removeItem(at: url) }
     try fileManager.createSymbolicLink(at: url, withDestinationURL: destination)
+  }
+  func addWriteACL(to url: URL) throws {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/chmod")
+    process.arguments = ["+a", "everyone allow write", url.path]
+    try process.run()
+    process.waitUntilExit()
+    guard process.terminationStatus == 0 else {
+      throw NSError(domain: NSPOSIXErrorDomain, code: Int(process.terminationStatus))
+    }
+  }
+
+  func makeImmutable(_ url: URL) throws {
+    guard chflags(url.path, UInt32(UF_IMMUTABLE)) == 0 else {
+      throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+    }
+  }
+
+  func clearFlags(on url: URL) throws {
+    guard chflags(url.path, 0) == 0 else {
+      throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+    }
   }
 }
