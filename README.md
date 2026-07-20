@@ -53,7 +53,7 @@ Authentication outcomes compose with the rest of the PAM stack:
 
 The optional module arguments are `reason=<text>` and `timeout=<1...120>`. The default timeout is 30 seconds.
 
-AuthenticationServices is not used here: Apple documents that framework for app and service sign-in, credentials, passkeys, and SSO. Direct device-owner approval remains part of [LocalAuthentication](https://developer.apple.com/documentation/localauthentication).
+[AuthenticationServices](https://developer.apple.com/documentation/authenticationservices) is not used here: Apple documents that framework for app and service sign-in, credentials, passkeys, and SSO. Direct device-owner approval remains part of [LocalAuthentication](https://developer.apple.com/documentation/localauthentication).
 
 ## Requirements and build
 
