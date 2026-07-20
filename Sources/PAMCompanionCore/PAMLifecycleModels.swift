@@ -169,6 +169,24 @@ struct PAMFileMetadata: Codable, Equatable {
   let ownerGroupID: UInt32
   let flags: UInt32
   let extendedAttributes: [String: Data]
+
+  static func trackedExtendedAttributes(_ attributes: [String: Data]) -> [String: Data] {
+    attributes.filter { name, _ in
+      // macOS rewrites this opaque, path-managed value during otherwise
+      // metadata-preserving renames. It cannot be treated as rollback state.
+      name != "com.apple.provenance"
+    }
+  }
+
+  func normalizingTrackedExtendedAttributes() -> PAMFileMetadata {
+    PAMFileMetadata(
+      mode: mode,
+      ownerUserID: ownerUserID,
+      ownerGroupID: ownerGroupID,
+      flags: flags,
+      extendedAttributes: Self.trackedExtendedAttributes(extendedAttributes)
+    )
+  }
 }
 
 struct PAMLifecycleSnapshot: Codable, Equatable {
@@ -177,6 +195,16 @@ struct PAMLifecycleSnapshot: Codable, Equatable {
   let existed: Bool
   let originalSHA256: String?
   let metadata: PAMFileMetadata?
+
+  func normalizingTrackedExtendedAttributes() -> PAMLifecycleSnapshot {
+    PAMLifecycleSnapshot(
+      path: path,
+      backupName: backupName,
+      existed: existed,
+      originalSHA256: originalSHA256,
+      metadata: metadata?.normalizingTrackedExtendedAttributes()
+    )
+  }
 }
 
 struct PAMLifecycleRecord: Codable, Equatable {
@@ -187,4 +215,16 @@ struct PAMLifecycleRecord: Codable, Equatable {
   let installedModuleSHA256: String
   var installedPolicyMetadata: PAMFileMetadata?
   var installedModuleMetadata: PAMFileMetadata?
+
+  func normalizingTrackedExtendedAttributes() -> PAMLifecycleRecord {
+    PAMLifecycleRecord(
+      schemaVersion: schemaVersion,
+      phase: phase,
+      snapshots: snapshots.map { $0.normalizingTrackedExtendedAttributes() },
+      installedPolicySHA256: installedPolicySHA256,
+      installedModuleSHA256: installedModuleSHA256,
+      installedPolicyMetadata: installedPolicyMetadata?.normalizingTrackedExtendedAttributes(),
+      installedModuleMetadata: installedModuleMetadata?.normalizingTrackedExtendedAttributes()
+    )
+  }
 }
