@@ -28,7 +28,7 @@ final class PAMLifecycleManagerTests: XCTestCase {
     XCTAssertEqual(try system.mode(system.paths.sudoLocal), originalMode)
     XCTAssertEqual(
       try system.fileIdentity(
-        system.paths.stateDirectory.appendingPathComponent("sudo_local.original")),
+        system.backupURL(for: system.paths.sudoLocal)),
       originalIdentity
     )
     XCTAssertEqual(
@@ -206,10 +206,13 @@ final class PAMLifecycleManagerTests: XCTestCase {
     let fileSystem = system.fileSystem
     try fileSystem.createStateDirectory(system.paths.stateDirectory)
     let targets = [
-      (system.paths.sudoLocal, "sudo_local.original"),
-      (system.paths.canonicalModule, "pam_companion.so.original"),
-      (system.paths.legacyModule, "pam_watchid.so.original"),
-      (system.paths.legacyVersionedModule, "pam_watchid.so.2.original"),
+      (system.paths.sudoLocal, system.backupName(for: system.paths.sudoLocal)),
+      (system.paths.canonicalModule, system.backupName(for: system.paths.canonicalModule)),
+      (system.paths.legacyModule, system.backupName(for: system.paths.legacyModule)),
+      (
+        system.paths.legacyVersionedModule,
+        system.backupName(for: system.paths.legacyVersionedModule)
+      ),
     ]
     let snapshots = try targets.map {
       try fileSystem.snapshot($0.0, backupName: $0.1)
@@ -228,9 +231,9 @@ final class PAMLifecycleManagerTests: XCTestCase {
       record,
       to: system.paths.stateDirectory.appendingPathComponent("record.json")
     )
-    try fileSystem.installModule(
+    try fileSystem.stageModule(
       system.moduleBytes,
-      to: system.paths.stateDirectory.appendingPathComponent("pam_companion.so.pending")
+      at: system.stagedURL(for: system.paths.canonicalModule)
     )
 
     let manager = system.manager()
@@ -302,12 +305,32 @@ final class PAMLifecycleManagerTests: XCTestCase {
     let manager = system.manager()
     _ = try manager.setup(dryRun: false)
     try FileManager.default.removeItem(
-      at: system.paths.stateDirectory.appendingPathComponent("sudo_local.original"))
+      at: system.backupURL(for: system.paths.sudoLocal))
 
     XCTAssertThrowsError(try manager.status()) { error in
       XCTAssertEqual(
         error as? PAMLifecycleError,
-        .invalidState("missing backup: sudo_local.original")
+        .invalidState("missing backup: .sudo_local.pam-companion.original")
+      )
+    }
+  }
+
+  func testOrphanedLifecycleSiblingIsRejectedWithoutAJournal() throws {
+    let system = try TemporaryPAMSystem()
+    defer { system.remove() }
+    let orphan = system.stagedURL(for: system.paths.canonicalModule)
+    try system.moduleBytes.write(to: orphan)
+
+    XCTAssertThrowsError(try system.manager().status()) { error in
+      XCTAssertEqual(
+        error as? PAMLifecycleError,
+        .invalidState("unexpected lifecycle file without a transaction: \(orphan.path)")
+      )
+    }
+    XCTAssertThrowsError(try system.manager().setup(dryRun: false)) { error in
+      XCTAssertEqual(
+        error as? PAMLifecycleError,
+        .invalidState("unexpected lifecycle file without a transaction: \(orphan.path)")
       )
     }
   }
@@ -480,21 +503,21 @@ private final class TemporaryPAMSystem {
     let plan = try PAMConfigurationPlanner.plan(try read(paths.sudoLocal))
     try fileSystem.createStateDirectory(paths.stateDirectory)
     let targets = [
-      (paths.sudoLocal, "sudo_local.original"),
-      (paths.canonicalModule, "pam_companion.so.original"),
-      (paths.legacyModule, "pam_watchid.so.original"),
-      (paths.legacyVersionedModule, "pam_watchid.so.2.original"),
+      (paths.sudoLocal, backupName(for: paths.sudoLocal)),
+      (paths.canonicalModule, backupName(for: paths.canonicalModule)),
+      (paths.legacyModule, backupName(for: paths.legacyModule)),
+      (paths.legacyVersionedModule, backupName(for: paths.legacyVersionedModule)),
     ]
     let snapshots = try targets.map {
       try fileSystem.snapshot($0.0, backupName: $0.1)
     }
-    let stagedModule = paths.stateDirectory.appendingPathComponent("pam_companion.so.pending")
-    let stagedPolicy = paths.stateDirectory.appendingPathComponent("sudo_local.pending")
-    try fileSystem.installModule(moduleBytes, to: stagedModule)
-    try fileSystem.replacePolicy(
-      stagedPolicy,
-      with: Data(plan.updated.utf8),
-      template: paths.sudoLocal
+    let stagedModule = stagedURL(for: paths.canonicalModule)
+    let stagedPolicy = stagedURL(for: paths.sudoLocal)
+    try fileSystem.stageModule(moduleBytes, at: stagedModule)
+    try fileSystem.stagePolicy(
+      Data(plan.updated.utf8),
+      at: stagedPolicy,
+      preserving: paths.sudoLocal
     )
     let record = PAMLifecycleRecord(
       schemaVersion: 2,
@@ -517,8 +540,8 @@ private final class TemporaryPAMSystem {
       record.snapshots.first(where: { $0.path == paths.sudoLocal.path }))
     let moduleMetadata = try XCTUnwrap(record.installedModuleMetadata)
     let policyMetadata = try XCTUnwrap(record.installedPolicyMetadata)
-    let stagedModule = paths.stateDirectory.appendingPathComponent("pam_companion.so.pending")
-    let stagedPolicy = paths.stateDirectory.appendingPathComponent("sudo_local.pending")
+    let stagedModule = stagedURL(for: paths.canonicalModule)
+    let stagedPolicy = stagedURL(for: paths.sudoLocal)
     try fileSystem.moveOriginalToBackup(canonical, in: paths.stateDirectory)
     try fileSystem.moveStagedFile(
       stagedModule,
@@ -539,6 +562,19 @@ private final class TemporaryPAMSystem {
     try fileManager.removeItem(at: paths.moduleSource)
     try data.write(to: paths.moduleSource)
     XCTAssertEqual(chmod(paths.moduleSource.path, 0o444), 0)
+  }
+
+  func backupName(for target: URL) -> String {
+    ".\(target.lastPathComponent).pam-companion.original"
+  }
+
+  func backupURL(for target: URL) -> URL {
+    target.deletingLastPathComponent().appendingPathComponent(backupName(for: target))
+  }
+
+  func stagedURL(for target: URL) -> URL {
+    target.deletingLastPathComponent()
+      .appendingPathComponent(".\(target.lastPathComponent).pam-companion.pending")
   }
 
   func exists(_ url: URL) -> Bool { fileManager.fileExists(atPath: url.path) }
