@@ -199,7 +199,7 @@ struct PAMLifecycleFileSystem {
 
   func moveOriginalToBackup(_ snapshot: PAMLifecycleSnapshot, in stateDirectory: URL) throws {
     let target = URL(fileURLWithPath: snapshot.path)
-    let backup = stateDirectory.appendingPathComponent(snapshot.backupName)
+    let backup = backupURL(for: snapshot)
     try validateStateDirectory(stateDirectory)
     try validateAncestors(of: target)
     if !snapshot.existed {
@@ -220,21 +220,39 @@ struct PAMLifecycleFileSystem {
     try validateOriginal(snapshot, at: backup)
   }
 
-  func installModule(_ data: Data, to target: URL) throws {
+  func backupURL(for snapshot: PAMLifecycleSnapshot) -> URL {
+    URL(fileURLWithPath: snapshot.path)
+      .deletingLastPathComponent()
+      .appendingPathComponent(snapshot.backupName)
+  }
+
+  func stageModule(_ data: Data, at target: URL) throws {
     try validateAncestors(of: target)
     guard !exists(target) else { throw PAMLifecycleError.managedStateDrift(target.path) }
-    let temporary = temporarySibling(of: target)
+    let descriptor = open(
+      target.path,
+      O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+      0o400
+    )
+    guard descriptor >= 0 else { throw fileSystemError(target.path) }
+    var completed = false
+    defer {
+      close(descriptor)
+      if !completed { _ = unlink(target.path) }
+    }
     do {
-      try data.write(to: temporary, options: [.withoutOverwriting])
-      guard chmod(temporary.path, 0o444) == 0,
-        chown(temporary.path, expectedOwnerUserID, expectedOwnerGroupID) == 0
-      else {
-        throw fileSystemError(temporary.path)
+      guard fchown(descriptor, expectedOwnerUserID, expectedOwnerGroupID) == 0 else {
+        throw fileSystemError(target.path)
       }
-      try syncFile(temporary)
-      try replace(temporary, target: target)
+      try write(data, to: descriptor, path: target.path)
+      guard fchmod(descriptor, 0o444) == 0,
+        fsync(descriptor) == 0
+      else {
+        throw fileSystemError(target.path)
+      }
+      try syncDirectory(target.deletingLastPathComponent())
+      completed = true
     } catch {
-      try? fileManager.removeItem(at: temporary)
       throw error
     }
   }
@@ -270,37 +288,39 @@ struct PAMLifecycleFileSystem {
     }
   }
 
-  func replacePolicy(_ target: URL, with data: Data, template: URL) throws {
+  func stagePolicy(_ data: Data, at target: URL, preserving template: URL) throws {
     try validateAncestors(of: target)
     guard !exists(target) else { throw PAMLifecycleError.managedStateDrift(target.path) }
     try validateRegularRootTarget(template)
-    let temporary = temporarySibling(of: target)
     var info = stat()
     guard lstat(template.path, &info) == 0 else { throw fileSystemError(template.path) }
     do {
-      try copy(template, to: temporary)
-      guard chmod(temporary.path, 0o600) == 0 else { throw fileSystemError(temporary.path) }
+      // The deterministic sibling is intentional: if power is lost while staging,
+      // the preparing journal can find and remove the partial file. Moving a staged
+      // file across directories would also let macOS rewrite provenance metadata.
+      try copy(template, to: target)
+      guard chmod(target.path, 0o600) == 0 else { throw fileSystemError(target.path) }
       do {
-        try data.write(to: temporary, options: [])
+        try data.write(to: target, options: [])
       } catch {
-        throw fileSystemError(temporary.path)
+        throw fileSystemError(target.path)
       }
-      guard chown(temporary.path, info.st_uid, info.st_gid) == 0,
-        chmod(temporary.path, info.st_mode & 0o7777) == 0
+      guard chown(target.path, info.st_uid, info.st_gid) == 0,
+        chmod(target.path, info.st_mode & 0o7777) == 0
       else {
-        throw fileSystemError(temporary.path)
+        throw fileSystemError(target.path)
       }
-      try syncFile(temporary)
-      try replace(temporary, target: target)
+      try syncFile(target)
+      try syncDirectory(target.deletingLastPathComponent())
     } catch {
-      try? fileManager.removeItem(at: temporary)
+      try? fileManager.removeItem(at: target)
       throw error
     }
   }
 
   func restore(_ snapshot: PAMLifecycleSnapshot, from stateDirectory: URL) throws {
     let target = URL(fileURLWithPath: snapshot.path)
-    let backup = stateDirectory.appendingPathComponent(snapshot.backupName)
+    let backup = backupURL(for: snapshot)
     try validateStateDirectory(stateDirectory)
     try validateAncestors(of: target)
     if snapshot.existed {
@@ -325,6 +345,33 @@ struct PAMLifecycleFileSystem {
       } catch {
         throw fileSystemError(target.path)
       }
+    }
+  }
+
+  func removeStagedFile(
+    _ url: URL,
+    sha256 expectedSHA256: String?,
+    metadata expectedMetadata: PAMFileMetadata?
+  ) throws {
+    guard exists(url) else { return }
+    if let expectedSHA256, let expectedMetadata {
+      guard
+        try managedFileMatches(
+          at: url,
+          sha256: expectedSHA256,
+          metadata: expectedMetadata
+        )
+      else {
+        throw PAMLifecycleError.managedStateDrift(url.path)
+      }
+    } else {
+      try validateRegularRootTarget(url)
+    }
+    do {
+      try fileManager.removeItem(at: url)
+      try syncDirectory(url.deletingLastPathComponent())
+    } catch {
+      throw fileSystemError(url.path)
     }
   }
 
