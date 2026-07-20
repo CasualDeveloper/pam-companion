@@ -6,20 +6,16 @@ private func writeLine(_ value: String, to handle: FileHandle) {
   handle.write(Data((value + "\n").utf8))
 }
 
-private func installedModuleURL(arguments: [String]) -> URL {
-  let invoked = arguments.first ?? "pam-companion"
-  let executable = URL(
-    fileURLWithPath: invoked,
-    relativeTo: URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-  ).standardizedFileURL.resolvingSymlinksInPath()
-  return executable.deletingLastPathComponent()
-    .deletingLastPathComponent()
-    .appendingPathComponent("libexec/pam_companion.so")
-}
-
 let arguments = CommandLine.arguments
+let moduleURL: URL
+do {
+  moduleURL = try PAMExecutableLocation.installedModuleURL()
+} catch {
+  writeLine("pam-companion: \(error)", to: .standardError)
+  exit(1)
+}
 let lifecycle = PAMLifecycleManager(
-  paths: .system(moduleSource: installedModuleURL(arguments: arguments))
+  paths: .system(moduleSource: moduleURL)
 )
 let runner = PAMCommandLineRunner(
   lifecycle: lifecycle,

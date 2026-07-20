@@ -83,6 +83,28 @@ enum PAMLifecycleFailurePoint: String, CaseIterable, Codable, Sendable {
   case afterModuleInstalled
   case afterPolicyInstalled
   case afterLegacyRemoved
+  case afterRestoreStarted
+  case afterCanonicalRestored
+  case afterLegacyRestored
+  case afterVersionedLegacyRestored
+  case afterPolicyRestored
+  case beforeStateCleanup
+
+  static let setupCases: [Self] = [
+    .afterStatePrepared,
+    .afterModuleInstalled,
+    .afterPolicyInstalled,
+    .afterLegacyRemoved,
+  ]
+
+  static let restoreCases: [Self] = [
+    .afterRestoreStarted,
+    .afterCanonicalRestored,
+    .afterLegacyRestored,
+    .afterVersionedLegacyRestored,
+    .afterPolicyRestored,
+    .beforeStateCleanup,
+  ]
 }
 
 public enum PAMLifecycleError: Error, Equatable, CustomStringConvertible {
@@ -129,6 +151,7 @@ public enum PAMLifecycleError: Error, Equatable, CustomStringConvertible {
 enum PAMLifecyclePhase: String, Codable {
   case prepared
   case complete
+  case restoring
 }
 
 struct PAMLifecycleSnapshot: Codable, Equatable {

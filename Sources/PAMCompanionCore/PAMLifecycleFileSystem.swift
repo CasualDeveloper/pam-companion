@@ -6,9 +6,11 @@ struct PAMLifecycleFileSystem {
   let expectedOwnerUserID: uid_t
   let expectedOwnerGroupID: gid_t
   private let fileManager = FileManager.default
+  private let maximumModuleSize = 64 * 1024 * 1024
 
   func exists(_ url: URL) -> Bool {
-    fileManager.fileExists(atPath: url.path)
+    var info = stat()
+    return lstat(url.path, &info) == 0
   }
 
   func read(_ url: URL) throws -> Data {
@@ -20,59 +22,121 @@ struct PAMLifecycleFileSystem {
   }
 
   func validateRegularRootTarget(_ url: URL) throws {
+    try validateAncestors(of: url)
     var info = stat()
     guard lstat(url.path, &info) == 0 else { throw fileSystemError(url.path) }
     guard info.st_mode & S_IFMT == S_IFREG,
       info.st_uid == expectedOwnerUserID,
       info.st_gid == expectedOwnerGroupID,
-      info.st_mode & 0o022 == 0
+      info.st_mode & 0o022 == 0,
+      info.st_nlink == 1,
+      !hasUnsafeFlags(info),
+      try !hasExtendedACL(url.path)
     else {
       throw PAMLifecycleError.unsafePath(url.path)
     }
   }
 
   func validateDirectory(_ url: URL) throws {
+    try validateAncestors(of: url)
     var info = stat()
     guard lstat(url.path, &info) == 0 else { throw fileSystemError(url.path) }
     guard info.st_mode & S_IFMT == S_IFDIR,
       info.st_uid == expectedOwnerUserID,
       info.st_gid == expectedOwnerGroupID,
-      info.st_mode & 0o022 == 0
+      info.st_mode & 0o022 == 0,
+      !hasUnsafeFlags(info),
+      try !hasExtendedACL(url.path)
     else {
       throw PAMLifecycleError.unsafePath(url.path)
     }
   }
 
   func validateStateDirectory(_ url: URL) throws {
+    try validateAncestors(of: url)
     var info = stat()
     guard lstat(url.path, &info) == 0 else { throw fileSystemError(url.path) }
     guard info.st_mode & S_IFMT == S_IFDIR,
       info.st_uid == expectedOwnerUserID,
       info.st_gid == expectedOwnerGroupID,
-      info.st_mode & 0o777 == 0o700
+      info.st_mode & 0o777 == 0o700,
+      !hasUnsafeFlags(info),
+      try !hasExtendedACL(url.path)
     else {
       throw PAMLifecycleError.unsafePath(url.path)
     }
   }
 
   func validateRecordFile(_ url: URL) throws {
+    try validateAncestors(of: url)
     var info = stat()
     guard lstat(url.path, &info) == 0 else { throw fileSystemError(url.path) }
     guard info.st_mode & S_IFMT == S_IFREG,
       info.st_uid == expectedOwnerUserID,
       info.st_gid == expectedOwnerGroupID,
-      info.st_mode & 0o777 == 0o600
+      info.st_mode & 0o777 == 0o600,
+      info.st_nlink == 1,
+      !hasUnsafeFlags(info),
+      try !hasExtendedACL(url.path)
     else {
       throw PAMLifecycleError.unsafePath(url.path)
     }
   }
 
-  func validateSourceModule(_ url: URL) throws {
+  func readSourceModule(_ url: URL) throws -> Data {
+    try validateAncestors(of: url)
+    let descriptor = open(url.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+    guard descriptor >= 0 else { throw fileSystemError(url.path) }
+    defer { close(descriptor) }
     var info = stat()
-    guard lstat(url.path, &info) == 0 else { throw fileSystemError(url.path) }
-    guard info.st_mode & S_IFMT == S_IFREG, info.st_mode & 0o022 == 0 else {
+    guard fstat(descriptor, &info) == 0 else { throw fileSystemError(url.path) }
+    guard info.st_mode & S_IFMT == S_IFREG,
+      info.st_mode & 0o022 == 0,
+      info.st_nlink == 1,
+      info.st_size > 0,
+      info.st_size <= maximumModuleSize,
+      !hasUnsafeFlags(info),
+      try !hasExtendedACL(descriptor)
+    else {
       throw PAMLifecycleError.unsafePath(url.path)
     }
+    var data = Data(count: Int(info.st_size))
+    let total = data.count
+    var offset = 0
+    while offset < total {
+      let count = data.withUnsafeMutableBytes { bytes in
+        Darwin.pread(
+          descriptor,
+          bytes.baseAddress?.advanced(by: offset),
+          total - offset,
+          off_t(offset)
+        )
+      }
+      guard count > 0 else { throw fileSystemError(url.path) }
+      offset += count
+    }
+    return data
+  }
+
+  func withTemporaryModule<T>(_ data: Data, operation: (URL) throws -> T) throws -> T {
+    var template = Array("/var/tmp/pam-companion.validate.XXXXXX".utf8CString)
+    let descriptor = mkstemp(&template)
+    guard descriptor >= 0 else { throw fileSystemError("/var/tmp") }
+    let path = String(
+      decoding: template.prefix { $0 != 0 }.map(UInt8.init(bitPattern:)), as: UTF8.self)
+    let url = URL(fileURLWithPath: path)
+    defer {
+      close(descriptor)
+      _ = unlink(url.path)
+    }
+    guard fchmod(descriptor, 0o400) == 0,
+      fchown(descriptor, expectedOwnerUserID, expectedOwnerGroupID) == 0
+    else {
+      throw fileSystemError(url.path)
+    }
+    try write(data, to: descriptor, path: url.path)
+    guard fsync(descriptor) == 0 else { throw fileSystemError(url.path) }
+    return try operation(url)
   }
 
   func policyFiles(in directory: URL) throws -> [String: Data] {
@@ -91,6 +155,7 @@ struct PAMLifecycleFileSystem {
       let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
       guard values.isSymbolicLink != true else { throw PAMLifecycleError.unsafePath(url.path) }
       guard values.isRegularFile == true else { continue }
+      try validateRegularRootTarget(url)
       policies[url.path] = try read(url)
     }
     return policies
@@ -109,6 +174,7 @@ struct PAMLifecycleFileSystem {
       throw fileSystemError(url.path)
     }
     try syncDirectory(url.deletingLastPathComponent())
+    try validateStateDirectory(url)
   }
 
   func snapshot(_ target: URL, backupName: String, stateDirectory: URL) throws
@@ -124,13 +190,14 @@ struct PAMLifecycleFileSystem {
     let backup = stateDirectory.appendingPathComponent(backupName)
     try copy(target, to: backup)
     try syncFile(backup)
+    try validateRegularRootTarget(backup)
     return descriptor
   }
 
-  func installModule(from source: URL, to target: URL) throws {
+  func installModule(_ data: Data, to target: URL) throws {
     let temporary = temporarySibling(of: target)
     do {
-      try copy(source, to: temporary)
+      try data.write(to: temporary, options: [.withoutOverwriting])
       guard chmod(temporary.path, 0o444) == 0,
         chown(temporary.path, expectedOwnerUserID, expectedOwnerGroupID) == 0
       else {
@@ -145,6 +212,7 @@ struct PAMLifecycleFileSystem {
   }
 
   func replacePolicy(_ target: URL, with data: Data) throws {
+    try validateRegularRootTarget(target)
     let temporary = temporarySibling(of: target)
     var info = stat()
     guard lstat(target.path, &info) == 0 else { throw fileSystemError(target.path) }
@@ -205,6 +273,7 @@ struct PAMLifecycleFileSystem {
 
   func removeTree(_ url: URL) throws {
     guard exists(url) else { return }
+    try validateStateDirectory(url)
     do {
       try fileManager.removeItem(at: url)
       try syncDirectory(url.deletingLastPathComponent())
@@ -224,6 +293,7 @@ struct PAMLifecycleFileSystem {
     }
     let temporary = temporarySibling(of: url)
     do {
+      if exists(url) { try validateRecordFile(url) }
       try data.write(to: temporary, options: [.withoutOverwriting])
       guard chmod(temporary.path, 0o600) == 0,
         chown(temporary.path, expectedOwnerUserID, expectedOwnerGroupID) == 0
@@ -260,25 +330,31 @@ struct PAMLifecycleFileSystem {
   func sha256(_ url: URL) throws -> String { sha256(try read(url)) }
 
   func withLock<T>(_ url: URL, operation: () throws -> T) throws -> T {
+    try validateDirectory(url.deletingLastPathComponent())
     let descriptor = open(url.path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0o600)
     guard descriptor >= 0 else { throw fileSystemError(url.path) }
     defer {
       _ = flock(descriptor, LOCK_UN)
       _ = close(descriptor)
-      _ = unlink(url.path)
     }
     var info = stat()
     guard fstat(descriptor, &info) == 0,
       info.st_mode & S_IFMT == S_IFREG,
       info.st_uid == expectedOwnerUserID,
       info.st_gid == expectedOwnerGroupID,
-      info.st_mode & 0o777 == 0o600
+      info.st_mode & 0o777 == 0o600,
+      info.st_nlink == 1,
+      !hasUnsafeFlags(info),
+      try !hasExtendedACL(descriptor)
     else {
       throw PAMLifecycleError.unsafePath(url.path)
     }
     guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
-      throw PAMLifecycleError.fileSystem(path: url.path, message: "another lifecycle operation is active")
+      throw PAMLifecycleError.fileSystem(
+        path: url.path, message: "another lifecycle operation is active")
     }
+    guard fsync(descriptor) == 0 else { throw fileSystemError(url.path) }
+    try syncDirectory(url.deletingLastPathComponent())
     return try operation()
   }
 
@@ -311,6 +387,78 @@ struct PAMLifecycleFileSystem {
     guard descriptor >= 0 else { throw fileSystemError(url.path) }
     defer { close(descriptor) }
     guard fsync(descriptor) == 0 else { throw fileSystemError(url.path) }
+  }
+
+  private func validateAncestors(of url: URL) throws {
+    let parentPath = url.deletingLastPathComponent().path
+    guard let resolved = realpath(parentPath, nil) else { throw fileSystemError(parentPath) }
+    defer { free(resolved) }
+    let parent = URL(
+      fileURLWithFileSystemRepresentation: resolved,
+      isDirectory: true,
+      relativeTo: nil
+    )
+    var current = URL(fileURLWithPath: "/", isDirectory: true)
+    try validateAncestor(current)
+    for component in parent.pathComponents.dropFirst() {
+      current.appendPathComponent(component, isDirectory: true)
+      try validateAncestor(current)
+    }
+  }
+
+  private func validateAncestor(_ url: URL) throws {
+    var info = stat()
+    guard lstat(url.path, &info) == 0 else { throw fileSystemError(url.path) }
+    guard info.st_mode & S_IFMT == S_IFDIR,
+      !hasUnsafeFlags(info),
+      try !hasExtendedACL(url.path)
+    else {
+      throw PAMLifecycleError.unsafePath(url.path)
+    }
+  }
+
+  private func hasUnsafeFlags(_ info: stat) -> Bool {
+    let unsafe = UInt32(UF_IMMUTABLE | UF_APPEND | SF_IMMUTABLE | SF_APPEND)
+    return info.st_flags & unsafe != 0
+  }
+
+  private func hasExtendedACL(_ path: String) throws -> Bool {
+    errno = 0
+    guard let accessControlList = path.withCString({ acl_get_link_np($0, ACL_TYPE_EXTENDED) })
+    else {
+      if errno == ENOENT { return false }
+      throw fileSystemError(path)
+    }
+    defer { acl_free(UnsafeMutableRawPointer(accessControlList)) }
+    return try hasEntries(accessControlList, path: path)
+  }
+
+  private func hasExtendedACL(_ descriptor: Int32) throws -> Bool {
+    errno = 0
+    guard let accessControlList = acl_get_fd_np(descriptor, ACL_TYPE_EXTENDED) else {
+      if errno == ENOENT { return false }
+      throw fileSystemError("file descriptor")
+    }
+    defer { acl_free(UnsafeMutableRawPointer(accessControlList)) }
+    return try hasEntries(accessControlList, path: "file descriptor")
+  }
+
+  private func hasEntries(_ accessControlList: acl_t, path: String) throws -> Bool {
+    var entry: acl_entry_t?
+    let result = acl_get_entry(accessControlList, ACL_FIRST_ENTRY.rawValue, &entry)
+    guard result != -1 else { throw fileSystemError(path) }
+    return result == 0
+  }
+
+  private func write(_ data: Data, to descriptor: Int32, path: String) throws {
+    var offset = 0
+    while offset < data.count {
+      let count = data.withUnsafeBytes { bytes in
+        Darwin.write(descriptor, bytes.baseAddress?.advanced(by: offset), data.count - offset)
+      }
+      guard count > 0 else { throw fileSystemError(path) }
+      offset += count
+    }
   }
 
   private func fileSystemError(_ path: String) -> PAMLifecycleError {

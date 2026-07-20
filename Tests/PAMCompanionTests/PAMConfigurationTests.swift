@@ -50,10 +50,9 @@ final class PAMConfigurationPlannerTests: XCTestCase {
     XCTAssertTrue(plan.replacedLegacyModules.isEmpty)
   }
 
-  func testCommentsAndSimilarNamesAreNotTreatedAsInstalledModules() throws {
+  func testCommentsAreAllowedAndSimilarActiveModulesAreRejected() throws {
     let original = """
       # auth sufficient pam_watchid.so
-      auth optional pam_watchid.so.backup
 
       """
 
@@ -64,11 +63,16 @@ final class PAMConfigurationPlannerTests: XCTestCase {
       """
       # auth sufficient pam_watchid.so
       auth       sufficient     pam_companion.so
-      auth optional pam_watchid.so.backup
 
       """
     )
     XCTAssertTrue(plan.replacedLegacyModules.isEmpty)
+
+    XCTAssertThrowsError(
+      try PAMConfigurationPlanner.plan("auth optional pam_watchid.so.backup\n")
+    ) { error in
+      XCTAssertEqual(error as? PAMConfigurationError, .unsupportedLocalPolicy)
+    }
   }
 
   func testDuplicateCompanionFamilyEntriesAreRejected() {
@@ -102,7 +106,36 @@ final class PAMConfigurationPlannerTests: XCTestCase {
 
   func testInvalidUTF8AndNulBytesAreRejected() {
     XCTAssertThrowsError(try PAMConfigurationPlanner.plan(Data([0xff])))
-    XCTAssertThrowsError(try PAMConfigurationPlanner.plan(Data("auth sufficient pam_tid.so\0\n".utf8)))
+    XCTAssertThrowsError(
+      try PAMConfigurationPlanner.plan(Data("auth sufficient pam_tid.so\0\n".utf8)))
+  }
+
+  func testOnlyKnownSafeSudoLocalShapesAreAccepted() throws {
+    let accepted = [
+      "# comments only\n",
+      "auth sufficient pam_tid.so\n",
+      "auth sufficient pam_watchid.so\n",
+      "auth sufficient pam_companion.so timeout=45\n",
+      "auth sufficient pam_tid.so\nauth sufficient pam_watchid.so reason=Approve\n",
+    ]
+    for configuration in accepted {
+      XCTAssertNoThrow(try PAMConfigurationPlanner.plan(configuration), configuration)
+    }
+
+    let rejected = [
+      "auth required pam_opendirectory.so\n",
+      "auth requisite pam_smartcard.so\n",
+      "auth include another_policy\n",
+      "auth sufficient pam_tid.so debug\n",
+      "auth sufficient pam_tid.so\nauth sufficient pam_tid.so\n",
+      "account required pam_permit.so\n",
+    ]
+    for configuration in rejected {
+      XCTAssertThrowsError(try PAMConfigurationPlanner.plan(configuration), configuration) {
+        error in
+        XCTAssertEqual(error as? PAMConfigurationError, .unsupportedLocalPolicy)
+      }
+    }
   }
 }
 
