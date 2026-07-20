@@ -24,34 +24,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-      - name: Install Swift 6.3.3
-        run: |
-          set -euo pipefail
-          curl --fail --location --silent --show-error \
-            https://download.swift.org/swiftly/darwin/swiftly.pkg \
-            --output "$RUNNER_TEMP/swiftly.pkg"
-          /usr/sbin/installer \
-            -pkg "$RUNNER_TEMP/swiftly.pkg" \
-            -target CurrentUserHomeDirectory
-          "$HOME/.swiftly/bin/swiftly" init \
-            --skip-install \
-            --no-modify-profile \
-            --quiet-shell-followup \
-            --assume-yes
-          "$HOME/.swiftly/bin/swiftly" install 6.3.3 --assume-yes
-          echo "$HOME/.swiftly/bin" >> "$GITHUB_PATH"
-
       - name: Runner versions
         run: |
           sw_vers
           uname -m
           swift --version
-          swiftly run swift --version | grep -F 'Swift version 6.3.3'
 
       - name: Build CLI and PAM module
         run: |
-          swiftly run swift build -c release --product pam-companion -Xswiftc -warnings-as-errors
-          swiftly run swift build -c release --product PAMCompanionModule -Xswiftc -warnings-as-errors
+          swift build -c release --product pam-companion -Xswiftc -warnings-as-errors
+          swift build -c release --product PAMCompanionModule -Xswiftc -warnings-as-errors
 
       - name: Test
         run: swift test -Xswiftc -warnings-as-errors
