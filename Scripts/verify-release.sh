@@ -95,8 +95,8 @@ module="$package/libexec/pam_companion.so"
 
 verify_binary() {
     binary=$1
-    lipo -verify_arch arm64 "$binary"
-    lipo -verify_arch x86_64 "$binary"
+    lipo "$binary" -verify_arch arm64
+    lipo "$binary" -verify_arch x86_64
     [ "$(lipo -archs "$binary" | wc -w | tr -d ' ')" -eq 2 ]
     codesign --verify --strict "$binary"
     signature=$(codesign -d --verbose=4 "$binary" 2>&1)
