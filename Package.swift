@@ -6,8 +6,12 @@ let package = Package(
   name: "pam-companion",
   platforms: [.macOS(.v14)],
   products: [
-    .library(
+    .executable(
       name: "pam-companion",
+      targets: ["PAMCompanionCLI"]
+    ),
+    .library(
+      name: "PAMCompanionModule",
       type: .dynamic,
       targets: ["PAMCompanion"]
     )
@@ -21,6 +25,11 @@ let package = Package(
     .target(
       name: "PAMCompanionCore",
       path: "Sources/PAMCompanionCore"
+    ),
+    .executableTarget(
+      name: "PAMCompanionCLI",
+      dependencies: ["PAMCompanionCore"],
+      path: "Sources/PAMCompanionCLI"
     ),
     .target(
       name: "PAMCompanion",

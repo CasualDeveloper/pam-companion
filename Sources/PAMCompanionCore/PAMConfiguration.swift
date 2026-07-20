@@ -3,6 +3,8 @@ import Foundation
 public enum PAMConfigurationError: Error, Equatable, CustomStringConvertible {
   case invalidEncoding
   case duplicateModuleEntries
+  case unsupportedModuleEntry
+  case invalidModuleArguments
 
   public var description: String {
     switch self {
@@ -10,6 +12,10 @@ public enum PAMConfigurationError: Error, Equatable, CustomStringConvertible {
       return "PAM configuration must be NUL-free UTF-8"
     case .duplicateModuleEntries:
       return "PAM configuration contains multiple companion module entries"
+    case .unsupportedModuleEntry:
+      return "companion module entries must use 'auth sufficient'"
+    case .invalidModuleArguments:
+      return "companion module entry contains unsupported arguments"
     }
   }
 }
@@ -40,11 +46,18 @@ public enum PAMConfigurationPlanner {
     }
 
     var lines = configuration.components(separatedBy: "\n")
-    let matches = lines.enumerated().compactMap { index, line -> ModuleEntry? in
+    let matches = try lines.enumerated().compactMap { index, line -> ModuleEntry? in
       guard let tokens = policyTokens(line), tokens.count >= 3 else { return nil }
       let module = moduleName(tokens[2])
       guard module == canonicalModule || legacyModules.contains(module) else { return nil }
-      return ModuleEntry(index: index, module: module, arguments: Array(tokens.dropFirst(3)))
+      guard tokens[0] == "auth", tokens[1] == "sufficient" else {
+        throw PAMConfigurationError.unsupportedModuleEntry
+      }
+      let arguments = Array(tokens.dropFirst(3))
+      guard (try? PAMModuleOptionParser.parse(arguments)) != nil else {
+        throw PAMConfigurationError.invalidModuleArguments
+      }
+      return ModuleEntry(index: index, module: module, arguments: arguments)
     }
 
     guard matches.count <= 1 else {
@@ -96,10 +109,10 @@ public struct PAMLegacyReference: Equatable, Comparable, Sendable {
 }
 
 public enum PAMReferenceScanner {
-  public static func legacyReferences(in policies: [String: Data]) -> [PAMLegacyReference] {
-    policies.flatMap { path, data -> [PAMLegacyReference] in
+  public static func legacyReferences(in policies: [String: Data]) throws -> [PAMLegacyReference] {
+    try policies.flatMap { path, data -> [PAMLegacyReference] in
       guard let content = String(data: data, encoding: .utf8), !data.contains(0) else {
-        return []
+        throw PAMConfigurationError.invalidEncoding
       }
       return content.components(separatedBy: "\n").compactMap { line in
         guard let tokens = policyTokens(line), tokens.count >= 3 else { return nil }
